@@ -190,7 +190,7 @@ Instructions:
 
             fixed_line = ""
             if isinstance(result, FixResult):
-                fixed_line = result.fixed_line
+                fixed_line = getattr(result, "fixed_line", "") or ""
             elif isinstance(result, dict) and "fixed_line" in result:
                 fixed_line = str(result["fixed_line"])
             elif isinstance(result, str):

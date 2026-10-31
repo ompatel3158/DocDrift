@@ -273,10 +273,11 @@ class GemmaClient:
         # Sensible fallback
         if isinstance(response_schema, type) and issubclass(response_schema, BaseModel):
             try:
-                return response_schema.model_construct()
+                fields = {k: "" for k in response_schema.model_fields}
+                return response_schema.model_construct(**fields)
             except Exception:
                 try:
-                    return response_schema()
+                    return response_schema.model_construct()
                 except Exception:
                     return {}
         if isinstance(response_schema, list) or getattr(response_schema, "__origin__", None) is list:

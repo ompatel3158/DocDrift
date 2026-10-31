@@ -2,6 +2,16 @@ import json
 import os
 import sys
 from typing import List, Optional
+
+if sys.platform == "win32":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import typer
 from rich.console import Console
 from rich.panel import Panel

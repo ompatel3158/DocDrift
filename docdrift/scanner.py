@@ -34,6 +34,15 @@ class DocScanner:
     def find_doc_files(self) -> List[str]:
         """Finds all relevant markdown documents in the repository."""
         doc_files: List[str] = []
+        seen_canonical: Set[str] = set()
+
+        def add_file(p: str):
+            if not os.path.isfile(p):
+                return
+            canon = os.path.normcase(os.path.realpath(p))
+            if canon not in seen_canonical:
+                seen_canonical.add(canon)
+                doc_files.append(p)
 
         if not os.path.exists(self.repo_path):
             return doc_files
@@ -51,8 +60,7 @@ class DocScanner:
         ]
         for name in readme_candidates:
             candidate = os.path.join(self.repo_path, name)
-            if os.path.isfile(candidate) and candidate not in doc_files:
-                doc_files.append(candidate)
+            add_file(candidate)
 
         # Walk through the repo finding markdown files while respecting ignores
         for root, dirs, files in os.walk(self.repo_path):
@@ -61,8 +69,7 @@ class DocScanner:
             for file in files:
                 if file.lower().endswith((".md", ".markdown")):
                     full_path = os.path.join(root, file)
-                    if full_path not in doc_files:
-                        doc_files.append(full_path)
+                    add_file(full_path)
 
         # Sort for deterministic processing (README first, then docs)
         def sort_key(path: str):
