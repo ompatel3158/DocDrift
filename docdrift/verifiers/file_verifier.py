@@ -87,6 +87,44 @@ class FileVerifier(BaseVerifier):
                 suggested_value=None,
             )
 
+        # 0e. Check if target is an HTTP API endpoint route (/api/..., /v1/..., or mentioned with HTTP verbs)
+        raw_line_l = (claim.raw_line or "").lower()
+        is_api_route = (
+            raw_val.startswith(("/api/", "/v1/", "/v2/", "/graphql", "/health", "/auth/"))
+            or any(raw_val.lower().startswith(m) for m in ("get ", "post ", "put ", "delete ", "patch "))
+            or (raw_val.startswith("/") and any(m in raw_line_l for m in ("post ", "get ", "put ", "delete ", "endpoint", "route", "api")))
+        )
+        if is_api_route:
+            clean_route = re.sub(r"^(get|post|put|delete|patch)\s+", "", raw_val, flags=re.IGNORECASE).strip()
+            route_pat = re.compile(re.escape(clean_route))
+            found_route = False
+            for code_file in repo.glob("**/*"):
+                if not code_file.is_file():
+                    continue
+                if code_file.suffix.lower() not in (".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs"):
+                    continue
+                if any(d in code_file.parts for d in (".git", "node_modules", "dist", "build", ".venv", "venv")):
+                    continue
+                try:
+                    if route_pat.search(code_file.read_text(encoding="utf-8", errors="ignore")):
+                        found_route = True
+                        break
+                except Exception:
+                    pass
+
+            if found_route:
+                return VerificationResult(
+                    verdict=Verdict.VERIFIED,
+                    evidence=f"API endpoint route '{clean_route}' verified in repository codebase.",
+                    suggested_value=None,
+                )
+            else:
+                return VerificationResult(
+                    verdict=Verdict.UNKNOWN,
+                    evidence=f"API endpoint route '{clean_route}' referenced in documentation.",
+                    suggested_value=None,
+                )
+
         # 0d. Check if the target is an uncommitted local runtime file (.env, .env.local, .venv)
         LOCAL_RUNTIME_FILES = {
             ".env", ".env.local", ".env.development.local", ".env.test.local",
