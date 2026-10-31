@@ -53,6 +53,16 @@ def run_pipeline(
         console.print(f"[bold red]Error:[/bold red] Target path '{repo_path}' does not exist.")
         raise typer.Exit(code=1)
 
+    from docdrift.ai_client import load_env_file
+    load_env_file([
+        os.path.join(repo_path, ".env"),
+        os.path.join(os.getcwd(), ".env"),
+    ])
+    if model == "gemma-4-26b-it" and os.environ.get("DOCDRIFT_MODEL"):
+        model = os.environ.get("DOCDRIFT_MODEL")
+    if "DOCDRIFT_USE_ULTSQL" in os.environ:
+        prefer_ultsql = os.environ.get("DOCDRIFT_USE_ULTSQL", "true").lower() in ("true", "1", "yes")
+
     try:
         # 2. Initialize Memory Backend (UltSQL with local fallback)
         from docdrift.memory import get_memory_backend

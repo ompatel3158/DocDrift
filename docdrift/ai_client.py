@@ -12,7 +12,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Callable, Optional, Set, Type, TypeVar
+from typing import Any, Callable, List, Optional, Set, Type, TypeVar
 
 from google import genai
 from google.genai import errors, types
@@ -21,7 +21,33 @@ from pydantic import BaseModel
 logger = logging.getLogger("docdrift.ai_client")
 
 # Strict Gemma 4 Model Configuration
-DEFAULT_MODEL: str = "gemma-4-26b-it"
+def load_env_file(search_paths: Optional[List[str]] = None) -> None:
+    """Zero-dependency .env file loader for DocDrift."""
+    paths_to_check = search_paths or [
+        os.path.join(os.getcwd(), ".env"),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env")),
+    ]
+    for p in paths_to_check:
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+                break
+            except Exception:
+                pass
+
+
+load_env_file()
+
+DEFAULT_MODEL: str = os.environ.get("DOCDRIFT_MODEL", "gemma-4-26b-it")
 SUPPORTED_MODELS: Set[str] = {
     "gemma-4-26b-it",
     "gemma-4-31b-it",
@@ -76,6 +102,7 @@ class GemmaClient:
         """
         validate_gemma_model(model)
         self.model = model
+        load_env_file()
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
         self.offline = offline or not bool(self.api_key)
         self.max_retries = max_retries

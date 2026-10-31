@@ -554,3 +554,14 @@ def test_reviewer_interactive_custom_inputs(tmp_path):
     assert "Line 3: `manually_edited`" in content
     assert "Line 4: `old3`" in content  # skipped
     assert "Line 5: `old4`" in content  # quit before reaching
+
+
+def test_load_env_file(tmp_path):
+    """Verify zero-dependency .env file loading."""
+    env_file = tmp_path / ".env"
+    env_file.write_text("TEST_DOCDRIFT_KEY=xyz123\n# Comment\nDOCDRIFT_TEST_VAR=\"hello_world\"\n", encoding="utf-8")
+
+    from docdrift.ai_client import load_env_file
+    load_env_file([str(env_file)])
+    assert os.environ.get("TEST_DOCDRIFT_KEY") == "xyz123"
+    assert os.environ.get("DOCDRIFT_TEST_VAR") == "hello_world"
