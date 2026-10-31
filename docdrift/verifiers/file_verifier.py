@@ -86,6 +86,41 @@ class FileVerifier(BaseVerifier):
                 suggested_value=None,
             )
 
+        # 0d. Check if the target is an uncommitted local runtime file (.env, .env.local, .venv)
+        LOCAL_RUNTIME_FILES = {
+            ".env", ".env.local", ".env.development.local", ".env.test.local",
+            ".venv", "venv", ".pytest_cache", "__pycache__"
+        }
+        raw_val_clean = raw_val.split("#")[0].strip().replace("\\", "/")
+        base_name = os.path.basename(raw_val_clean).lower()
+        if base_name in LOCAL_RUNTIME_FILES:
+            raw_line_lower = (claim.raw_line or "").lower()
+            doc_file = Path(claim.doc_path) if claim.doc_path else Path("README.md")
+            doc_dir = (doc_file if doc_file.is_absolute() else (repo / doc_file)).parent.resolve()
+
+            templates = [
+                doc_dir / ".env.example",
+                doc_dir / ".env.sample",
+                doc_dir / ".env.template",
+                repo / ".env.example",
+                repo / ".env.sample",
+                repo / ".env.template",
+                repo / "backend" / ".env.example",
+            ]
+            found_template = next((t for t in templates if t.exists()), None)
+
+            is_negative_or_template = any(k in raw_line_lower for k in (
+                "never commit", "do not commit", "dont commit", "gitignore",
+                "copy", "cp ", "touch ", "create ", "add ", "copy-item", "example"
+            ))
+            if is_negative_or_template or found_template:
+                template_note = f"; template '{found_template.name}' found." if found_template else "."
+                return VerificationResult(
+                    verdict=Verdict.VERIFIED,
+                    evidence=f"Local runtime file '{raw_val}' is correctly omitted from git repository{template_note}",
+                    suggested_value=None,
+                )
+
         # Strip URL/markdown anchor fragments (e.g. docs/install.md#prerequisites)
         clean_target = raw_val.split("#")[0].strip()
         if not clean_target:

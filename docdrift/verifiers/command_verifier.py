@@ -24,6 +24,12 @@ except ImportError:
 from docdrift.models import Claim, ClaimType, Verdict, VerificationResult
 from docdrift.verifiers.base import BaseVerifier
 
+STANDARD_PYTHON_MODULES: Set[str] = {
+    "pip", "venv", "pytest", "unittest", "http.server", "json.tool",
+    "timeit", "pdb", "zipfile", "tarfile", "pydoc", "doctest",
+    "cProfile", "trace", "ensurepip", "site", "idlelib", "turtle"
+}
+
 SEMANTIC_SCRIPT_GROUPS: Dict[str, Set[str]] = {
     "start": {"start", "dev", "serve", "server", "watch", "run", "start:dev", "start:prod", "up"},
     "test": {"test", "spec", "check", "test-tap", "jest", "mocha", "pytest", "test:unit", "test:e2e"},
@@ -155,12 +161,29 @@ class MultiManifestVerifier(BaseVerifier):
 
         tool = tokens[0].lower()
 
+        # 0. Virtual environment activation (e.g. .\.venv\Scripts\Activate.ps1 or source .venv/bin/activate)
+        if "activate" in full_cmd.lower() and any(v in full_cmd.lower() for v in (".venv", "venv", "scripts", "bin")):
+            return VerificationResult(
+                verdict=Verdict.VERIFIED,
+                evidence=f"Virtual environment activation command '{full_cmd}' recognized.",
+                suggested_value=None,
+            )
+
         # Dispatch based on tool
         if tool in ("npm", "yarn", "pnpm", "bun"):
             return self._verify_node_command(full_cmd, tokens, repo)
 
-        if tool in ("poetry", "uv", "python", "python3"):
-            return self._verify_python_command(full_cmd, tokens, repo)
+        if tool in ("poetry", "uv", "python", "python3", "py", "py.exe"):
+            return self._verify_python_command(full_cmd, tokens, repo, claim)
+
+        if tool in ("uvicorn", "gunicorn"):
+            return self._verify_asgi_command(full_cmd, tokens, repo, claim)
+
+        if tool == "cd" and len(tokens) >= 2:
+            return self._verify_cd_command(tokens[1], repo, claim)
+
+        if tool in ("copy-item", "cp", "copy") and len(tokens) >= 3:
+            return self._verify_copy_command(tokens[1], repo, claim)
 
         if tool in ("docker", "docker-compose"):
             return self._verify_docker_command(full_cmd, tokens, repo)
@@ -199,7 +222,7 @@ class MultiManifestVerifier(BaseVerifier):
         if not pkg_json.exists() and not scripts:
             return VerificationResult(
                 verdict=Verdict.DRIFTED,
-                evidence=f"Command '{full_cmd}' requires 'package.json', but none was found in the repository root.",
+                evidence=f"Command '{full_cmd}' requires 'package.json', but none was found in the repository.",
                 suggested_value=None,
             )
 
@@ -323,13 +346,35 @@ class MultiManifestVerifier(BaseVerifier):
                 except Exception:
                     pass
 
+        # 4. Monorepo subfolders: frontend, client, web, ui, apps/*
+        for sub_name in ("frontend", "client", "web", "ui", "app", "backend"):
+            sub_pkg = repo / sub_name / "package.json"
+            if sub_pkg.exists():
+                try:
+                    data = json.loads(sub_pkg.read_text(encoding="utf-8"))
+                    for k, v in data.get("scripts", {}).items():
+                        if k not in scripts:
+                            scripts[k] = str(v)
+                except Exception:
+                    pass
+        for sub_pkg in repo.glob("apps/*/package.json"):
+            try:
+                data = json.loads(sub_pkg.read_text(encoding="utf-8"))
+                for k, v in data.get("scripts", {}).items():
+                    if k not in scripts:
+                        scripts[k] = str(v)
+            except Exception:
+                pass
+
         return scripts
 
     # --------------------------------------------------------------------------
     # Python Verifier
     # --------------------------------------------------------------------------
 
-    def _verify_python_command(self, full_cmd: str, tokens: List[str], repo: Path) -> VerificationResult:
+    def _verify_python_command(
+        self, full_cmd: str, tokens: List[str], repo: Path, claim: Optional[Claim] = None
+    ) -> VerificationResult:
         """Validates 'poetry run <cmd>', 'uv run <cmd>', 'python -m <module>'."""
         tool = tokens[0]
 
@@ -406,10 +451,57 @@ class MultiManifestVerifier(BaseVerifier):
                 suggested_value=None,
             )
 
-        # 3. python -m <module> or python <script.py>
-        if tool in ("python", "python3"):
+        # 3. python / python3 / py / py.exe -m <module> or python <script.py>
+        if tool in ("python", "python3", "py", "py.exe"):
             if len(tokens) >= 3 and tokens[1] == "-m":
-                module = tokens[2]
+                module = tokens[2].lower()
+                if module in STANDARD_PYTHON_MODULES:
+                    if module == "pip" and "-r" in tokens:
+                        r_idx = tokens.index("-r")
+                        if len(tokens) > r_idx + 1:
+                            req_file = tokens[r_idx + 1].strip("'\"`")
+                            doc_file = Path(claim.doc_path) if claim and claim.doc_path else Path("README.md")
+                            doc_dir = (doc_file if doc_file.is_absolute() else (repo / doc_file)).parent.resolve()
+
+                            candidates = [
+                                (doc_dir / req_file).resolve(),
+                                (repo / req_file).resolve(),
+                                (repo / "backend" / req_file).resolve(),
+                            ]
+                            found_req = next((c for c in candidates if c.is_file()), None)
+                            if not found_req:
+                                for root, _, files in os.walk(repo):
+                                    if any(d in root for d in (".git", "node_modules", ".venv")):
+                                        continue
+                                    if req_file.lower() in [f.lower() for f in files]:
+                                        found_req = Path(root, req_file)
+                                        break
+
+                            if found_req:
+                                rel_req = found_req.relative_to(repo).as_posix()
+                                return VerificationResult(
+                                    verdict=Verdict.VERIFIED,
+                                    evidence=f"Requirements file '{req_file}' verified at '{rel_req}' using standard pip.",
+                                    suggested_value=None,
+                                )
+                            else:
+                                return VerificationResult(
+                                    verdict=Verdict.DRIFTED,
+                                    evidence=f"Requirements file '{req_file}' not found in repository.",
+                                    suggested_value=None,
+                                )
+                    elif module == "venv":
+                        return VerificationResult(
+                            verdict=Verdict.VERIFIED,
+                            evidence="Standard Python venv virtual environment module verified.",
+                            suggested_value=None,
+                        )
+                    return VerificationResult(
+                        verdict=Verdict.VERIFIED,
+                        evidence=f"Standard Python library module '{module}' verified.",
+                        suggested_value=None,
+                    )
+
                 return self._verify_python_module(module, full_cmd, repo)
             elif len(tokens) >= 2:
                 script_path = tokens[1]
@@ -951,6 +1043,146 @@ class MultiManifestVerifier(BaseVerifier):
         return None
 
     # --------------------------------------------------------------------------
+    # Subproject, ASGI & Navigation helpers
+    # --------------------------------------------------------------------------
+
+    def _verify_cd_command(self, target_dir_raw: str, repo: Path, claim: Claim) -> VerificationResult:
+        """Verifies if cd <dir> targets an existing repository folder."""
+        target_dir = target_dir_raw.strip("'\"`").replace("\\", "/").rstrip("/")
+        doc_file = Path(claim.doc_path) if claim.doc_path else Path("README.md")
+        doc_dir = (doc_file if doc_file.is_absolute() else (repo / doc_file)).parent.resolve()
+
+        cand1 = (repo / target_dir).resolve()
+        cand2 = (doc_dir / target_dir).resolve()
+
+        if cand1.is_dir() and self._is_within_repo(cand1, repo):
+            rel = cand1.relative_to(repo).as_posix()
+            return VerificationResult(
+                verdict=Verdict.VERIFIED,
+                evidence=f"Directory '{target_dir}' exists in repository at '{rel}'.",
+                suggested_value=None,
+            )
+        elif cand2.is_dir() and self._is_within_repo(cand2, repo):
+            rel = cand2.relative_to(repo).as_posix()
+            return VerificationResult(
+                verdict=Verdict.VERIFIED,
+                evidence=f"Directory '{target_dir}' exists in repository at '{rel}'.",
+                suggested_value=None,
+            )
+
+        for root, dirs, _ in os.walk(repo):
+            if any(d in root for d in (".git", "node_modules", ".venv")):
+                continue
+            if target_dir.lower() in [d.lower() for d in dirs]:
+                found_rel = Path(root, target_dir).relative_to(repo).as_posix()
+                return VerificationResult(
+                    verdict=Verdict.VERIFIED,
+                    evidence=f"Directory '{target_dir}' found in repository at '{found_rel}'.",
+                    suggested_value=None,
+                )
+
+        return VerificationResult(
+            verdict=Verdict.DRIFTED,
+            evidence=f"Directory '{target_dir}' does not exist in repository.",
+            suggested_value=None,
+        )
+
+    def _verify_copy_command(self, src_file_raw: str, repo: Path, claim: Claim) -> VerificationResult:
+        """Verifies that the source file in a copy command exists in the repo."""
+        src_file = src_file_raw.strip("'\"`").replace("\\", "/")
+        doc_file = Path(claim.doc_path) if claim.doc_path else Path("README.md")
+        doc_dir = (doc_file if doc_file.is_absolute() else (repo / doc_file)).parent.resolve()
+
+        candidates = [
+            (doc_dir / src_file).resolve(),
+            (repo / src_file).resolve(),
+            (repo / "backend" / src_file).resolve(),
+        ]
+        found = next((c for c in candidates if c.exists()), None)
+        if not found:
+            for root, _, files in os.walk(repo):
+                if any(d in root for d in (".git", "node_modules", ".venv")):
+                    continue
+                if src_file.lower() in [f.lower() for f in files]:
+                    found = Path(root, src_file)
+                    break
+
+        if found:
+            rel = found.relative_to(repo).as_posix()
+            return VerificationResult(
+                verdict=Verdict.VERIFIED,
+                evidence=f"Source template file '{src_file}' for copy instruction verified at '{rel}'.",
+                suggested_value=None,
+            )
+
+        return VerificationResult(
+            verdict=Verdict.DRIFTED,
+            evidence=f"Source template file '{src_file}' does not exist in repository.",
+            suggested_value=None,
+        )
+
+    def _verify_asgi_command(self, full_cmd: str, tokens: List[str], repo: Path, claim: Claim) -> VerificationResult:
+        """Verifies 'uvicorn <app_spec>' or 'gunicorn <app_spec>'."""
+        app_spec = None
+        for tok in tokens[1:]:
+            if ":" in tok and not tok.startswith("-"):
+                app_spec = tok.strip("'\"`")
+                break
+
+        if not app_spec:
+            return VerificationResult(
+                verdict=Verdict.VERIFIED,
+                evidence=f"ASGI runner command '{full_cmd}' recognized.",
+                suggested_value=None,
+            )
+
+        mod_part, _, app_obj = app_spec.partition(":")
+        mod_file = mod_part.replace(".", "/") + ".py"
+
+        doc_file = Path(claim.doc_path) if claim.doc_path else Path("README.md")
+        doc_dir = (doc_file if doc_file.is_absolute() else (repo / doc_file)).parent.resolve()
+
+        candidates = [
+            (doc_dir / mod_file).resolve(),
+            (repo / mod_file).resolve(),
+            (repo / "backend" / mod_file).resolve(),
+            (repo / "src" / mod_file).resolve(),
+        ]
+        found = next((c for c in candidates if c.is_file()), None)
+        if not found:
+            target_name = Path(mod_file).name.lower()
+            for root, _, files in os.walk(repo):
+                if any(d in root for d in (".git", "node_modules", ".venv")):
+                    continue
+                if target_name in [f.lower() for f in files]:
+                    cand = Path(root, target_name)
+                    if cand.as_posix().endswith(mod_file):
+                        found = cand
+                        break
+
+        if found:
+            rel = found.relative_to(repo).as_posix()
+            return VerificationResult(
+                verdict=Verdict.VERIFIED,
+                evidence=f"FastAPI/ASGI entrypoint '{app_spec}' verified in '{rel}'.",
+                suggested_value=None,
+            )
+
+        return VerificationResult(
+            verdict=Verdict.DRIFTED,
+            evidence=f"Module file '{mod_file}' for ASGI entrypoint '{app_spec}' not found in repository.",
+            suggested_value=None,
+        )
+
+    @staticmethod
+    def _is_within_repo(target: Path, repo: Path) -> bool:
+        try:
+            target.relative_to(repo)
+            return True
+        except ValueError:
+            return False
+
+    # --------------------------------------------------------------------------
     # Utility helpers
     # --------------------------------------------------------------------------
 
@@ -971,7 +1203,8 @@ class MultiManifestVerifier(BaseVerifier):
         first = line_clean.split()[0].lower()
         return first in (
             "npm", "npx", "yarn", "pnpm", "bun",
-            "python", "python3", "poetry", "uv",
+            "python", "python3", "py", "py.exe", "poetry", "uv",
+            "uvicorn", "gunicorn", "cd", "cp", "copy", "copy-item",
             "docker", "docker-compose",
             "cargo", "go", "make",
         )

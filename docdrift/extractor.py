@@ -61,7 +61,8 @@ SPECIAL_FILENAMES = {
 # Known command prefixes/utilities
 COMMAND_PREFIXES = (
     "npm ", "npx ", "yarn ", "pnpm ", "cargo ", "make ", "docker ",
-    "docker-compose ", "pytest", "python -m", "pip install", "uv ",
+    "docker-compose ", "pytest", "python ", "python3 ", "py ", "pip ", "uv ",
+    "uvicorn ", "gunicorn ", "cd ", "cp ", "copy ", "copy-item ",
     "go run", "go test", "go build", "mvn ", "gradle ",
 )
 
@@ -420,8 +421,8 @@ Allowed Claim Types:
 
 CRITICAL: Execution Context Tagging (`runs_in`):
 For each claim, determine where it executes or belongs:
-- 'repo': Commands, scripts, or files that belong directly to THIS repository and should be verified against this repo's root code/manifests (e.g. `npm test`, `src/index.js`, `pytest`).
-- 'generated_app': Tutorial or Quick Start commands that run inside a generated app or subfolder created by the reader (e.g. `express /tmp/foo && cd /tmp/foo`, then `npm start` or `npm install`, `create-react-app myapp`). These MUST NOT be verified against the repo!
+- 'repo': Commands, scripts, or files that belong directly to THIS repository and its subfolders/monorepo packages (e.g. `cd backend`, `cd frontend`, `npm test`, `uvicorn app.main:app`, `python -m pip install -r requirements.txt`). These MUST be verified against repository code and manifests.
+- 'generated_app': Tutorial or Quick Start commands where the reader creates a brand-new demo project from scratch outside the repo using a generator (e.g. `express /tmp/foo && cd /tmp/foo`, then `npm start`, or `create-react-app myapp`). Do NOT tag existing repo directories (like `frontend/`, `backend/`, `cd backend`) as generated_app!
 - 'user_machine': Commands installing global CLI tools (`npm install -g express-generator`, `brew install`, `apt-get`), or paths in `/tmp`, `/var`, `~`, or user home directories.
 - 'external': External URLs, documentation links, or third-party web services.
 
