@@ -8,6 +8,7 @@ from typing import List, Optional, Set
 
 from docdrift.models import Claim, ClaimType, Verdict, VerificationResult
 from docdrift.verifiers.base import BaseVerifier
+from docdrift.verifiers.code_analyzer import CodeAnalyzer
 
 
 DEFAULT_IGNORED_DIRS: Set[str] = {
@@ -130,6 +131,14 @@ class FileVerifier(BaseVerifier):
                 suggested_value=None,
             )
 
+        # Check if target specifies a symbol (e.g. backend/app/main.py:app)
+        claimed_symbol = claim.metadata.get("symbol")
+        if ":" in clean_target and not (len(clean_target) >= 2 and clean_target[1] == ":" and clean_target[0].isalpha()):
+            parts = clean_target.split(":", 1)
+            clean_target = parts[0].strip()
+            if not claimed_symbol and len(parts) > 1:
+                claimed_symbol = parts[1].strip()
+
         # Normalize relative path: remove leading slashes (e.g. /src/main.py -> src/main.py)
         normalized = clean_target.replace("\\", "/").lstrip("/")
         if normalized.startswith("./"):
@@ -139,13 +148,7 @@ class FileVerifier(BaseVerifier):
         root_candidate = (repo / normalized).resolve()
         if self._path_exists(root_candidate, repo):
             rel_display = root_candidate.relative_to(repo).as_posix()
-            kind = "Directory" if root_candidate.is_dir() else "File"
-            return VerificationResult(
-                verdict=Verdict.VERIFIED,
-                evidence=f"{kind} '{raw_val}' exists in repository at '{rel_display}'.",
-                suggested_value=None,
-                metadata={"resolved_path": str(root_candidate), "is_dir": root_candidate.is_dir()},
-            )
+            return self._verify_file_content_and_symbol(root_candidate, raw_val, rel_display, claim, claimed_symbol)
 
         # 2. Resolve relative to doc_path's directory
         if claim.doc_path:
@@ -157,13 +160,7 @@ class FileVerifier(BaseVerifier):
                     rel_display = doc_candidate.relative_to(repo).as_posix()
                 except ValueError:
                     rel_display = doc_candidate.as_posix()
-                kind = "Directory" if doc_candidate.is_dir() else "File"
-                return VerificationResult(
-                    verdict=Verdict.VERIFIED,
-                    evidence=f"{kind} '{raw_val}' exists relative to document at '{rel_display}'.",
-                    suggested_value=None,
-                    metadata={"resolved_path": str(doc_candidate), "is_dir": doc_candidate.is_dir()},
-                )
+                return self._verify_file_content_and_symbol(doc_candidate, raw_val, rel_display, claim, claimed_symbol)
 
         # 3. Search across all files and directories in the entire repository tree
         all_candidates = self._scan_repo_paths(repo)
@@ -185,12 +182,8 @@ class FileVerifier(BaseVerifier):
                     metadata={"closest_match": found_rel},
                 )
             else:
-                return VerificationResult(
-                    verdict=Verdict.VERIFIED,
-                    evidence=f"File '{raw_val}' found in repository at '{found_rel}'.",
-                    suggested_value=None,
-                    metadata={"resolved_path": str(repo / found_rel)},
-                )
+                found_path = (repo / found_rel).resolve()
+                return self._verify_file_content_and_symbol(found_path, raw_val, found_rel, claim, claimed_symbol, found_in_search=True)
 
         # 4. Fuzzy match for moved or renamed candidates
         closest_match = self._find_closest_match(normalized, all_candidates)
@@ -206,6 +199,57 @@ class FileVerifier(BaseVerifier):
             verdict=Verdict.DRIFTED,
             evidence=f"Path '{raw_val}' does not exist anywhere in the repository.",
             suggested_value=None,
+        )
+
+    def _verify_file_content_and_symbol(
+        self,
+        candidate: Path,
+        raw_val: str,
+        rel_display: str,
+        claim: Claim,
+        claimed_symbol: Optional[str] = None,
+        found_in_search: bool = False,
+    ) -> VerificationResult:
+        """Validates file syntax and declared symbols."""
+        verb = "found" if found_in_search else "exists"
+        if candidate.is_dir():
+            return VerificationResult(
+                verdict=Verdict.VERIFIED,
+                evidence=f"Directory '{raw_val}' {verb} in repository at '{rel_display}'.",
+                suggested_value=None,
+                metadata={"resolved_path": str(candidate), "is_dir": True},
+            )
+
+        # 1. Validate file syntax (AST / compilation)
+        syntax_ok, syntax_err = CodeAnalyzer.validate_file_syntax(candidate)
+        if not syntax_ok:
+            return VerificationResult(
+                verdict=Verdict.DRIFTED,
+                evidence=f"File '{raw_val}' exists in repository at '{rel_display}', but has syntax error: {syntax_err}.",
+                suggested_value=None,
+                metadata={"resolved_path": str(candidate), "syntax_valid": False, "syntax_error": syntax_err},
+            )
+
+        # 2. Check claimed symbol if specified
+        target_symbol = claimed_symbol or claim.metadata.get("symbol")
+        if target_symbol:
+            is_decl, symbols, closest = CodeAnalyzer.verify_symbol_in_file(candidate, target_symbol)
+            if not is_decl:
+                evidence = f"Symbol '{target_symbol}' is not declared in '{rel_display}'."
+                if closest:
+                    evidence += f" Did you mean '{closest}'?"
+                return VerificationResult(
+                    verdict=Verdict.DRIFTED,
+                    evidence=evidence,
+                    suggested_value=closest,
+                    metadata={"resolved_path": str(candidate), "declared_symbols": list(symbols)},
+                )
+
+        return VerificationResult(
+            verdict=Verdict.VERIFIED,
+            evidence=f"File '{raw_val}' {verb} in repository at '{rel_display}'.",
+            suggested_value=None,
+            metadata={"resolved_path": str(candidate), "is_dir": False, "syntax_valid": True},
         )
 
     @staticmethod

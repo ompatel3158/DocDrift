@@ -10,6 +10,7 @@ class ClaimType(str, Enum):
     ENV_VAR = "env_var"
     DOCKER_PORT = "docker_port"
     CLI_FLAG = "cli_flag"
+    DEPENDENCY = "dependency"
 
 
 class Verdict(str, Enum):

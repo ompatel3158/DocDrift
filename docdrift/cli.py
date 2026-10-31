@@ -118,10 +118,12 @@ def run_pipeline(
             from docdrift.verifiers.command_verifier import MultiManifestVerifier
             from docdrift.verifiers.env_verifier import EnvVerifier
             from docdrift.verifiers.sandbox_prober import SandboxCommandProber
+            from docdrift.verifiers.dependency_verifier import DependencyVerifier
 
             file_verifier = FileVerifier()
             cmd_verifier = MultiManifestVerifier()
             env_verifier = EnvVerifier(memory=memory)
+            dep_verifier = DependencyVerifier()
             sandbox_prober = SandboxCommandProber() if probe_commands else None
 
             verified_count = 0
@@ -154,14 +156,36 @@ def run_pipeline(
                     continue
 
                 v_res = None
-                if file_verifier.can_verify(claim):
+                if dep_verifier.can_verify(claim):
+                    v_res = dep_verifier.verify(claim, repo_path)
+                    if claim.claim_type == ClaimType.COMMAND_SCRIPT and v_res.verdict == Verdict.VERIFIED and sandbox_prober:
+                        probe_res = sandbox_prober.probe_command(claim.extracted_value, repo_path)
+                        if probe_res.verdict == Verdict.DRIFTED:
+                            v_res.verdict = Verdict.DRIFTED
+                            v_res.evidence = f"{v_res.evidence} | Execution probe failed: {probe_res.evidence}"
+                        elif probe_res.evidence:
+                            v_res.evidence = f"{v_res.evidence} | {probe_res.evidence}"
+                elif file_verifier.can_verify(claim):
                     v_res = file_verifier.verify(claim, repo_path)
                 elif cmd_verifier.can_verify(claim):
                     v_res = cmd_verifier.verify(claim, repo_path)
                     if v_res.verdict == Verdict.VERIFIED and sandbox_prober:
                         probe_res = sandbox_prober.probe_command(claim.extracted_value, repo_path)
-                        if probe_res.evidence:
-                            v_res.evidence += f" | {probe_res.evidence}"
+                        if probe_res.verdict == Verdict.DRIFTED:
+                            v_res.verdict = Verdict.DRIFTED
+                            v_res.evidence = f"{v_res.evidence} | Execution probe failed: {probe_res.evidence}"
+                        elif probe_res.evidence:
+                            v_res.evidence = f"{v_res.evidence} | {probe_res.evidence}"
+                    elif v_res.verdict == Verdict.UNKNOWN and sandbox_prober:
+                        probe_res = sandbox_prober.probe_command(claim.extracted_value, repo_path)
+                        if probe_res.verdict == Verdict.DRIFTED:
+                            v_res.verdict = Verdict.DRIFTED
+                            v_res.evidence = f"Execution probe failed: {probe_res.evidence}"
+                        elif probe_res.verdict == Verdict.VERIFIED and probe_res.evidence and any(
+                            k in probe_res.evidence.lower() for k in ("succeeded", "dry-run", "cleanly", "collection probe", "compilation probe")
+                        ):
+                            v_res.verdict = Verdict.VERIFIED
+                            v_res.evidence = probe_res.evidence
                 elif env_verifier.can_verify(claim):
                     v_res = env_verifier.verify(claim, repo_path)
 

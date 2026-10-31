@@ -106,3 +106,28 @@ def test_cli_review_no_drift_when_clean(tmp_path: Path):
     result = runner.invoke(app, ["review", str(empty_repo), "--offline"])
     assert result.exit_code == 0
     assert "No documentation drift found" in result.output
+
+
+def test_cli_check_with_pip_requirements_and_probing(tmp_path: Path):
+    """Verify that CLI check integrates DependencyVerifier and command probing."""
+    test_repo = tmp_path / "pip_repo"
+    test_repo.mkdir()
+    (test_repo / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    (test_repo / "app.py").write_text("import fastapi\nimport redis\n", encoding="utf-8")
+    (test_repo / "README.md").write_text(
+        "# Pip Project\n\n"
+        "Install dependencies:\n"
+        "```bash\n"
+        "pip install -r requirements.txt\n"
+        "```\n\n"
+        "Run application:\n"
+        "```bash\n"
+        "python app.py\n"
+        "```\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["check", str(test_repo), "--offline", "--probe"])
+    assert result.exit_code == 1
+    assert "redis" in result.output
+    assert "requirement" in result.output

@@ -134,8 +134,12 @@ def validate_fix(
     # 2. FILE_PATH Constraints
     elif claim.claim_type == ClaimType.FILE_PATH:
         # Cross-type check: Reject if proposed fix contains command runners
-        if any(f"{cmd} " in prop_token.lower() for cmd in ("npm", "yarn", "cargo", "make", "pytest", "docker")):
+        if any(f"{cmd} " in prop_token.lower() or prop_token.lower().startswith(f"{cmd} ") for cmd in ("npm", "yarn", "pnpm", "bun", "cargo", "make", "pytest", "docker", "python", "python3", "pip", "py", "uv", "node")):
             return False, f"Proposed fix '{prop_token}' is a command, not a file path"
+
+        # Reject prose / instruction phrases
+        if any(w in prop_token.lower().split() for w in ("install", "add", "run", "please", "update", "needs")):
+            return False, f"Proposed fix '{prop_token}' contains prose instructions, not a file path"
 
         # Check physical existence in repository
         if repo_path:

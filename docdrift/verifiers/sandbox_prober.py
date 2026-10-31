@@ -5,6 +5,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from pydantic import BaseModel, Field
@@ -108,32 +109,224 @@ class SandboxCommandProber(BaseVerifier):
         )
 
     def probe_command(self, command_str: str, cwd: str) -> VerificationResult:
-        """Safely probes a command via PATH toolchain checks or dry-run execution."""
-        tokens = self._tokenize(command_str.strip().strip("`"))
+        """Safely probes a command via PATH checks, dry-run execution, or startup verification."""
+        clean_str = command_str.strip().strip("`")
+        tokens = self._tokenize(clean_str)
         if not tokens:
             return VerificationResult(
                 verdict=Verdict.UNKNOWN,
                 evidence="Empty command string.",
             )
+
+        # 1. Strict security check
+        is_safe, reason = self.is_safe_command(tokens)
+        if not is_safe:
+            return VerificationResult(
+                verdict=Verdict.DRIFTED,
+                evidence=f"Security guard rejected command: {reason}",
+            )
+
         binary = tokens[0]
         if not self.is_tool_available(binary):
             return VerificationResult(
                 verdict=Verdict.UNKNOWN,
                 evidence=f"Tool '{binary}' not currently installed on system PATH.",
             )
-        # If make command, dry-run test
+
+        # 2. Make dry-run test
         if binary == "make":
             target = tokens[1] if len(tokens) > 1 and not tokens[1].startswith("-") else ""
             p_res = self.probe_make_target(target, cwd)
             if p_res.success:
-                return VerificationResult(verdict=Verdict.VERIFIED, evidence="Dry-run 'make -n' verified on PATH.")
+                target_disp = f" {target}" if target else ""
+                return VerificationResult(
+                    verdict=Verdict.VERIFIED,
+                    evidence=f"Dynamic dry-run 'make -n{target_disp}' succeeded.",
+                )
             else:
-                return VerificationResult(verdict=Verdict.UNKNOWN, evidence=f"make dry-run: {p_res.stderr or p_res.error or 'unknown'}")
+                return VerificationResult(
+                    verdict=Verdict.DRIFTED,
+                    evidence=f"Dry-run 'make -n' failed: {p_res.stderr or p_res.error or 'unknown error'}",
+                )
+
+        # 3. Server Startup Probes (uvicorn, gunicorn, flask run, http.server)
+        SERVER_COMMAND_BINARIES = {"uvicorn", "gunicorn"}
+        is_server_cmd = (
+            binary in SERVER_COMMAND_BINARIES
+            or (binary in ("python", "python3", "py", "uv") and any(s in clean_str for s in ("http.server", "runserver", "flask run")))
+        )
+        if is_server_cmd:
+            p_res = self.probe_server_startup(tokens, cwd=cwd, timeout_sec=1.5)
+            if p_res.success:
+                return VerificationResult(
+                    verdict=Verdict.VERIFIED,
+                    evidence=f"Live server startup probe succeeded: '{clean_str}' initialized cleanly without crashing.",
+                    metadata={"startup_verified": True},
+                )
+            else:
+                return VerificationResult(
+                    verdict=Verdict.DRIFTED,
+                    evidence=f"Live server startup probe failed: {p_res.error or p_res.stderr}",
+                    metadata={"startup_verified": False},
+                )
+
+        # 4. Python Compilation Probe (py_compile)
+        if binary in ("python", "python3", "py", "py.exe", "uv"):
+            target_file = None
+            if binary == "uv" and len(tokens) >= 3 and tokens[1] == "run":
+                target_file = tokens[2]
+            elif len(tokens) >= 2 and tokens[1] != "-m" and not tokens[1].startswith("-"):
+                target_file = tokens[1]
+
+            if target_file and target_file.endswith(".py"):
+                file_path = (Path(cwd) / target_file).resolve()
+                if not file_path.is_file():
+                    return VerificationResult(
+                        verdict=Verdict.DRIFTED,
+                        evidence=f"Target python script '{target_file}' does not exist in repository.",
+                    )
+                p_res = self.probe_python_compilation(str(file_path), cwd)
+                if p_res.success:
+                    return VerificationResult(
+                        verdict=Verdict.VERIFIED,
+                        evidence=f"Code compilation probe succeeded: 'python -m py_compile {target_file}' verified without errors.",
+                    )
+                else:
+                    return VerificationResult(
+                        verdict=Verdict.DRIFTED,
+                        evidence=f"Code compilation probe failed: {p_res.stderr or p_res.error}",
+                    )
+
+        # 5. Test Runner Collection Probe
+        if any(t in tokens for t in ("pytest", "unittest")):
+            p_res = self.probe_test_collection(tokens, cwd=cwd)
+            if p_res.success:
+                return VerificationResult(
+                    verdict=Verdict.VERIFIED,
+                    evidence=f"Test collection probe succeeded: '{clean_str}' verified.",
+                )
+            else:
+                return VerificationResult(
+                    verdict=Verdict.DRIFTED,
+                    evidence=f"Test collection probe failed: {p_res.stderr or p_res.error}",
+                )
+
+        # 6. Docker Compose Config Validation
+        if binary in ("docker", "docker-compose") and any(t in tokens for t in ("compose", "docker-compose")):
+            if self.is_tool_available("docker"):
+                cmd_cfg = ["docker", "compose", "config"] if binary == "docker" else ["docker-compose", "config"]
+                p_res = self.run_safe_command(cmd_cfg, cwd=cwd, timeout_sec=3.0)
+                if p_res.success:
+                    return VerificationResult(
+                        verdict=Verdict.VERIFIED,
+                        evidence="Docker compose configuration dry-run verified.",
+                    )
 
         return VerificationResult(
             verdict=Verdict.VERIFIED,
             evidence=f"Toolchain binary '{binary}' confirmed available on PATH.",
         )
+
+    def probe_server_startup(
+        self,
+        cmd: List[str],
+        cwd: Optional[str] = None,
+        timeout_sec: float = 1.5,
+        env: Optional[Dict[str, str]] = None,
+    ) -> ProbeResult:
+        """Executes a server command with bounded timeout to verify clean startup without crashing."""
+        is_safe, reason = self.is_safe_command(cmd)
+        if not is_safe:
+            return ProbeResult(success=False, command=cmd, error=reason, is_safe=False)
+
+        binary = cmd[0]
+        if not self.is_tool_available(binary):
+            return ProbeResult(success=False, command=cmd, error=f"Binary '{binary}' not found on PATH.")
+
+        exec_env = os.environ.copy()
+        if env:
+            exec_env.update(env)
+
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=exec_env,
+            )
+
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout_sec)
+                # Process exited within timeout
+                if proc.returncode != 0:
+                    return ProbeResult(
+                        success=False,
+                        exit_code=proc.returncode,
+                        stdout=stdout or "",
+                        stderr=stderr or "",
+                        command=cmd,
+                        error=f"Process exited on startup with code {proc.returncode}: {stderr.strip() or stdout.strip()}",
+                    )
+                else:
+                    return ProbeResult(
+                        success=True,
+                        exit_code=0,
+                        stdout=stdout or "",
+                        stderr=stderr or "",
+                        command=cmd,
+                    )
+            except subprocess.TimeoutExpired:
+                # Process is still running after timeout, confirming clean server boot!
+                try:
+                    proc.terminate()
+                    stdout, stderr = proc.communicate(timeout=0.5)
+                except (subprocess.TimeoutExpired, Exception):
+                    proc.kill()
+                    stdout, stderr = proc.communicate()
+
+                return ProbeResult(
+                    success=True,
+                    exit_code=0,
+                    stdout=stdout or "",
+                    stderr=stderr or "",
+                    command=cmd,
+                    metadata={"startup_verified": True},
+                )
+        except Exception as e:
+            return ProbeResult(
+                success=False,
+                command=cmd,
+                error=f"Execution error: {str(e)}",
+            )
+        finally:
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def probe_python_compilation(self, script_path: str, cwd: str) -> ProbeResult:
+        """Executes 'python -m py_compile <script>' to verify byte compilation."""
+        cmd = [sys.executable, "-m", "py_compile", str(script_path)]
+        return self.run_safe_command(cmd, cwd=cwd, timeout_sec=3.0)
+
+    def probe_test_collection(self, cmd: List[str], cwd: str) -> ProbeResult:
+        """Safely dry-runs test collection (e.g. pytest --collect-only) without running tests."""
+        clean_cmd: List[str] = []
+        is_pytest = any("pytest" in tok for tok in cmd)
+        if is_pytest:
+            for tok in cmd:
+                clean_cmd.append(tok)
+            if "--collect-only" not in clean_cmd:
+                clean_cmd.append("--collect-only")
+            if "-q" not in clean_cmd:
+                clean_cmd.append("-q")
+            return self.run_safe_command(clean_cmd, cwd=cwd, timeout_sec=5.0)
+
+        return self.run_safe_command(cmd, cwd=cwd, timeout_sec=3.0)
 
     # --------------------------------------------------------------------------
     # Security Validation

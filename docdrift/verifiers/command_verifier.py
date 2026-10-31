@@ -23,6 +23,7 @@ except ImportError:
 
 from docdrift.models import Claim, ClaimType, Verdict, VerificationResult
 from docdrift.verifiers.base import BaseVerifier
+from docdrift.verifiers.code_analyzer import CodeAnalyzer
 
 STANDARD_PYTHON_MODULES: Set[str] = {
     "pip", "venv", "pytest", "unittest", "http.server", "json.tool",
@@ -173,7 +174,7 @@ class MultiManifestVerifier(BaseVerifier):
         if tool in ("npm", "yarn", "pnpm", "bun"):
             return self._verify_node_command(full_cmd, tokens, repo)
 
-        if tool in ("poetry", "uv", "python", "python3", "py", "py.exe"):
+        if tool in ("poetry", "uv", "python", "python3", "py", "py.exe", "pip"):
             return self._verify_python_command(full_cmd, tokens, repo, claim)
 
         if tool in ("uvicorn", "gunicorn"):
@@ -235,6 +236,16 @@ class MultiManifestVerifier(BaseVerifier):
             "cache", "config", "dedupe", "prune", "doctor"
         }
         if tool == "npm":
+            if len(tokens) >= 2 and tokens[1] in ("install", "i", "add", "ci"):
+                from docdrift.verifiers.dependency_verifier import DependencyVerifier
+                c = claim or Claim(
+                    doc_path="README.md",
+                    line_number=1,
+                    raw_line=full_cmd,
+                    claim_type=ClaimType.COMMAND_SCRIPT,
+                    extracted_value=full_cmd,
+                )
+                return DependencyVerifier().verify(c, str(repo))
             if len(tokens) >= 2 and tokens[1] in STANDARD_NPM_COMMANDS:
                 return VerificationResult(
                     verdict=Verdict.VERIFIED,
@@ -252,8 +263,18 @@ class MultiManifestVerifier(BaseVerifier):
             if len(tokens) >= 3 and tokens[1] == "run":
                 target_script = tokens[2]
             elif len(tokens) >= 2:
-                # filter out non-script subcommands like 'yarn install', 'pnpm add', 'bun install'
-                if tokens[1] not in ("install", "add", "remove", "init", "publish", "pack"):
+                if tokens[1] in ("install", "add", "i"):
+                    from docdrift.verifiers.dependency_verifier import DependencyVerifier
+                    c = claim or Claim(
+                        doc_path="README.md",
+                        line_number=1,
+                        raw_line=full_cmd,
+                        claim_type=ClaimType.COMMAND_SCRIPT,
+                        extracted_value=full_cmd,
+                    )
+                    return DependencyVerifier().verify(c, str(repo))
+                # filter out non-script subcommands like 'remove', 'init', 'publish', 'pack'
+                if tokens[1] not in ("remove", "init", "publish", "pack"):
                     target_script = tokens[1]
                 else:
                     return VerificationResult(
@@ -426,10 +447,19 @@ class MultiManifestVerifier(BaseVerifier):
                 # Check if subcmd is a local file, e.g. 'uv run main.py'
                 local_file = (repo / subcmd).resolve()
                 if local_file.exists():
+                    syntax_ok, syntax_err = CodeAnalyzer.validate_file_syntax(local_file)
+                    if not syntax_ok:
+                        return VerificationResult(
+                            verdict=Verdict.DRIFTED,
+                            evidence=f"uv target file '{subcmd}' has syntax error: {syntax_err}.",
+                            suggested_value=None,
+                            metadata={"resolved_path": str(local_file), "syntax_valid": False},
+                        )
                     return VerificationResult(
                         verdict=Verdict.VERIFIED,
                         evidence=f"uv target file '{subcmd}' exists in repository.",
                         suggested_value=None,
+                        metadata={"resolved_path": str(local_file), "syntax_valid": True},
                     )
                 available = list(scripts.keys())
                 closest = self._find_closest_string(subcmd, available)
@@ -451,46 +481,34 @@ class MultiManifestVerifier(BaseVerifier):
                 suggested_value=None,
             )
 
+        # pip command (pip install ...)
+        if tool == "pip":
+            from docdrift.verifiers.dependency_verifier import DependencyVerifier
+            c = claim or Claim(
+                doc_path="README.md",
+                line_number=1,
+                raw_line=full_cmd,
+                claim_type=ClaimType.COMMAND_SCRIPT,
+                extracted_value=full_cmd,
+            )
+            return DependencyVerifier().verify(c, str(repo))
+
         # 3. python / python3 / py / py.exe -m <module> or python <script.py>
         if tool in ("python", "python3", "py", "py.exe"):
             if len(tokens) >= 3 and tokens[1] == "-m":
                 module = tokens[2].lower()
+                if module == "pip":
+                    from docdrift.verifiers.dependency_verifier import DependencyVerifier
+                    c = claim or Claim(
+                        doc_path="README.md",
+                        line_number=1,
+                        raw_line=full_cmd,
+                        claim_type=ClaimType.COMMAND_SCRIPT,
+                        extracted_value=full_cmd,
+                    )
+                    return DependencyVerifier().verify(c, str(repo))
                 if module in STANDARD_PYTHON_MODULES:
-                    if module == "pip" and "-r" in tokens:
-                        r_idx = tokens.index("-r")
-                        if len(tokens) > r_idx + 1:
-                            req_file = tokens[r_idx + 1].strip("'\"`")
-                            doc_file = Path(claim.doc_path) if claim and claim.doc_path else Path("README.md")
-                            doc_dir = (doc_file if doc_file.is_absolute() else (repo / doc_file)).parent.resolve()
-
-                            candidates = [
-                                (doc_dir / req_file).resolve(),
-                                (repo / req_file).resolve(),
-                                (repo / "backend" / req_file).resolve(),
-                            ]
-                            found_req = next((c for c in candidates if c.is_file()), None)
-                            if not found_req:
-                                for root, _, files in os.walk(repo):
-                                    if any(d in root for d in (".git", "node_modules", ".venv")):
-                                        continue
-                                    if req_file.lower() in [f.lower() for f in files]:
-                                        found_req = Path(root, req_file)
-                                        break
-
-                            if found_req:
-                                rel_req = found_req.relative_to(repo).as_posix()
-                                return VerificationResult(
-                                    verdict=Verdict.VERIFIED,
-                                    evidence=f"Requirements file '{req_file}' verified at '{rel_req}' using standard pip.",
-                                    suggested_value=None,
-                                )
-                            else:
-                                return VerificationResult(
-                                    verdict=Verdict.DRIFTED,
-                                    evidence=f"Requirements file '{req_file}' not found in repository.",
-                                    suggested_value=None,
-                                )
-                    elif module == "venv":
+                    if module == "venv":
                         return VerificationResult(
                             verdict=Verdict.VERIFIED,
                             evidence="Standard Python venv virtual environment module verified.",
@@ -501,16 +519,24 @@ class MultiManifestVerifier(BaseVerifier):
                         evidence=f"Standard Python library module '{module}' verified.",
                         suggested_value=None,
                     )
-
                 return self._verify_python_module(module, full_cmd, repo)
             elif len(tokens) >= 2:
                 script_path = tokens[1]
                 target = (repo / script_path).resolve()
                 if target.exists():
+                    syntax_ok, syntax_err = CodeAnalyzer.validate_file_syntax(target)
+                    if not syntax_ok:
+                        return VerificationResult(
+                            verdict=Verdict.DRIFTED,
+                            evidence=f"Python script '{script_path}' has syntax error: {syntax_err}.",
+                            suggested_value=None,
+                            metadata={"resolved_path": str(target), "syntax_valid": False},
+                        )
                     return VerificationResult(
                         verdict=Verdict.VERIFIED,
                         evidence=f"Python script '{script_path}' exists in repository.",
                         suggested_value=None,
+                        metadata={"resolved_path": str(target), "syntax_valid": True},
                     )
                 all_py = [p.relative_to(repo).as_posix() for p in repo.glob("**/*.py")]
                 closest = self._find_closest_string(script_path, all_py)
@@ -540,10 +566,19 @@ class MultiManifestVerifier(BaseVerifier):
 
         for cand in candidates:
             if cand.exists():
+                syntax_ok, syntax_err = CodeAnalyzer.validate_file_syntax(cand)
+                if not syntax_ok:
+                    return VerificationResult(
+                        verdict=Verdict.DRIFTED,
+                        evidence=f"Python module '{module}' has syntax error: {syntax_err}.",
+                        suggested_value=None,
+                        metadata={"resolved_path": str(cand), "syntax_valid": False},
+                    )
                 return VerificationResult(
                     verdict=Verdict.VERIFIED,
                     evidence=f"Python module '{module}' verified at '{cand.relative_to(repo).as_posix()}'.",
                     suggested_value=None,
+                    metadata={"resolved_path": str(cand), "syntax_valid": True},
                 )
 
         # Collect available python packages/modules
@@ -1136,17 +1171,23 @@ class MultiManifestVerifier(BaseVerifier):
                 suggested_value=None,
             )
 
-        mod_part, _, app_obj = app_spec.partition(":")
+        mod_part, _, raw_app_obj = app_spec.partition(":")
+        app_obj = raw_app_obj.strip().rstrip("()")
         mod_file = mod_part.replace(".", "/") + ".py"
+        pkg_init = mod_part.replace(".", "/") + "/__init__.py"
 
         doc_file = Path(claim.doc_path) if claim.doc_path else Path("README.md")
         doc_dir = (doc_file if doc_file.is_absolute() else (repo / doc_file)).parent.resolve()
 
         candidates = [
             (doc_dir / mod_file).resolve(),
+            (doc_dir / pkg_init).resolve(),
             (repo / mod_file).resolve(),
+            (repo / pkg_init).resolve(),
             (repo / "backend" / mod_file).resolve(),
+            (repo / "backend" / pkg_init).resolve(),
             (repo / "src" / mod_file).resolve(),
+            (repo / "src" / pkg_init).resolve(),
         ]
         found = next((c for c in candidates if c.is_file()), None)
         if not found:
@@ -1154,18 +1195,47 @@ class MultiManifestVerifier(BaseVerifier):
             for root, _, files in os.walk(repo):
                 if any(d in root for d in (".git", "node_modules", ".venv")):
                     continue
-                if target_name in [f.lower() for f in files]:
-                    cand = Path(root, target_name)
-                    if cand.as_posix().endswith(mod_file):
-                        found = cand
-                        break
+                for f in files:
+                    if f.lower() in (target_name, "__init__.py"):
+                        cand = Path(root, f)
+                        cand_posix = cand.as_posix()
+                        if cand_posix.endswith(mod_file) or cand_posix.endswith(pkg_init):
+                            found = cand
+                            break
+                if found:
+                    break
 
         if found:
             rel = found.relative_to(repo).as_posix()
+            # 1. Validate AST syntax
+            syntax_ok, syntax_err = CodeAnalyzer.validate_file_syntax(found)
+            if not syntax_ok:
+                return VerificationResult(
+                    verdict=Verdict.DRIFTED,
+                    evidence=f"FastAPI/ASGI module '{rel}' has syntax error: {syntax_err}.",
+                    suggested_value=None,
+                    metadata={"resolved_path": str(found), "syntax_valid": False},
+                )
+
+            # 2. Verify that claimed symbol is declared in AST
+            is_decl, symbols, closest = CodeAnalyzer.verify_symbol_in_file(found, app_obj)
+            if not is_decl:
+                suggested = full_cmd.replace(f":{raw_app_obj}", f":{closest}") if closest else None
+                evidence = f"FastAPI/ASGI entrypoint symbol '{raw_app_obj}' is not declared in '{rel}'. Declared symbols: {', '.join(sorted(symbols)) if symbols else 'none'}."
+                if closest:
+                    evidence += f" Did you mean '{closest}'?"
+                return VerificationResult(
+                    verdict=Verdict.DRIFTED,
+                    evidence=evidence,
+                    suggested_value=suggested,
+                    metadata={"resolved_path": str(found), "declared_symbols": list(symbols)},
+                )
+
             return VerificationResult(
                 verdict=Verdict.VERIFIED,
                 evidence=f"FastAPI/ASGI entrypoint '{app_spec}' verified in '{rel}'.",
                 suggested_value=None,
+                metadata={"resolved_path": str(found), "symbol": app_obj},
             )
 
         return VerificationResult(

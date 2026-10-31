@@ -170,3 +170,67 @@ class TestSandboxCommandProber:
         res = self.prober.verify(claim, ".")
         assert res.verdict == Verdict.DRIFTED
         assert "rejected" in res.evidence.lower()
+
+    def test_probe_python_compilation_success(self, tmp_path):
+        clean_file = tmp_path / "app.py"
+        clean_file.write_text("print('clean')\n")
+        res = self.prober.probe_python_compilation(str(clean_file), str(tmp_path))
+        assert res.success is True
+        assert res.exit_code == 0
+
+    def test_probe_python_compilation_syntax_error(self, tmp_path):
+        broken_file = tmp_path / "broken.py"
+        broken_file.write_text("def unclosed(\n")
+        res = self.prober.probe_python_compilation(str(broken_file), str(tmp_path))
+        assert res.success is False
+        assert "syntaxerror" in (res.stderr or res.error or "").lower()
+
+    def test_probe_server_startup_clean_running(self, tmp_path):
+        server_py = tmp_path / "server.py"
+        server_py.write_text(
+            "import time\n"
+            "print('Server listening on port 8000', flush=True)\n"
+            "time.sleep(10)\n"
+        )
+        res = self.prober.probe_server_startup(["python", "server.py"], cwd=str(tmp_path), timeout_sec=0.5)
+        assert res.success is True
+        assert res.metadata.get("startup_verified") is True
+
+    def test_probe_server_startup_immediate_crash(self, tmp_path):
+        crash_py = tmp_path / "crash.py"
+        crash_py.write_text(
+            "import sys\n"
+            "sys.stderr.write('Fatal: cannot bind to port 8000\\n')\n"
+            "sys.exit(1)\n"
+        )
+        res = self.prober.probe_server_startup(["python", "crash.py"], cwd=str(tmp_path), timeout_sec=1.0)
+        assert res.success is False
+        assert res.exit_code == 1
+        assert "Fatal: cannot bind" in (res.error or "")
+
+    def test_probe_command_python_compilation_success(self, tmp_path):
+        script = tmp_path / "script.py"
+        script.write_text("x = 42\n")
+        res = self.prober.probe_command("python script.py", str(tmp_path))
+        assert res.verdict == Verdict.VERIFIED
+        assert "compilation probe succeeded" in res.evidence
+
+    def test_probe_command_python_compilation_failure(self, tmp_path):
+        script = tmp_path / "bad.py"
+        script.write_text("def error(\n")
+        res = self.prober.probe_command("python bad.py", str(tmp_path))
+        assert res.verdict == Verdict.DRIFTED
+        assert "compilation probe failed" in res.evidence
+
+    def test_probe_command_server_startup_crash(self, tmp_path):
+        server = tmp_path / "crash_srv.py"
+        server.write_text("import sys; sys.stderr.write('Fatal: cannot bind to port 8000\\n'); sys.exit(1)\n")
+        with patch.object(self.prober, "is_tool_available", return_value=True):
+            with patch("subprocess.Popen") as mock_popen:
+                mock_proc = MagicMock()
+                mock_proc.communicate.return_value = ("", "Fatal: cannot bind to port 8000")
+                mock_proc.returncode = 1
+                mock_popen.return_value = mock_proc
+                res = self.prober.probe_command("uvicorn crash_srv:app", str(tmp_path))
+        assert res.verdict == Verdict.DRIFTED
+        assert "startup probe failed" in res.evidence

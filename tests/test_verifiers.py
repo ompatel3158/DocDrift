@@ -154,6 +154,48 @@ class TestFileVerifier:
         res = self.verifier.verify(claim, str(SAMPLE_REPO))
         assert res.verdict == Verdict.DRIFTED
 
+    def test_verify_file_syntax_error_detected_as_drift(self, tmp_path: Path):
+        broken_file = tmp_path / "broken.py"
+        broken_file.write_text("def unclosed_syntax(\n    return 1\n", encoding="utf-8")
+        claim = Claim(
+            doc_path="README.md",
+            line_number=1,
+            raw_line="Check `broken.py`",
+            claim_type=ClaimType.FILE_PATH,
+            extracted_value="broken.py",
+        )
+        res = self.verifier.verify(claim, str(tmp_path))
+        assert res.verdict == Verdict.DRIFTED
+        assert "syntax error" in res.evidence.lower()
+
+    def test_verify_file_with_symbol_specification_verified(self, tmp_path: Path):
+        service_file = tmp_path / "service.py"
+        service_file.write_text("app = 'fastapi_app'\n", encoding="utf-8")
+        claim = Claim(
+            doc_path="README.md",
+            line_number=1,
+            raw_line="Check `service.py:app`",
+            claim_type=ClaimType.FILE_PATH,
+            extracted_value="service.py:app",
+        )
+        res = self.verifier.verify(claim, str(tmp_path))
+        assert res.verdict == Verdict.VERIFIED
+
+    def test_verify_file_with_missing_symbol_drifted(self, tmp_path: Path):
+        service_file = tmp_path / "service.py"
+        service_file.write_text("server = 'fastapi_app'\n", encoding="utf-8")
+        claim = Claim(
+            doc_path="README.md",
+            line_number=1,
+            raw_line="Check `service.py:app`",
+            claim_type=ClaimType.FILE_PATH,
+            extracted_value="service.py:app",
+        )
+        res = self.verifier.verify(claim, str(tmp_path))
+        assert res.verdict == Verdict.DRIFTED
+        assert "not declared" in res.evidence
+        assert res.suggested_value == "server"
+
 
 # ==============================================================================
 # MultiManifestVerifier Tests
@@ -288,6 +330,51 @@ docdrift = "docdrift.cli:main"
         )
         res = self.verifier.verify(claim, str(tmp_path))
         assert res.verdict == Verdict.VERIFIED
+
+    def test_asgi_entrypoint_with_wrong_symbol_drifted(self, tmp_path: Path):
+        app_dir = tmp_path / "app"
+        app_dir.mkdir()
+        (app_dir / "main.py").write_text("server = 'fastapi_instance'\n", encoding="utf-8")
+        claim = Claim(
+            doc_path="README.md",
+            line_number=1,
+            raw_line="uvicorn app.main:app",
+            claim_type=ClaimType.COMMAND_SCRIPT,
+            extracted_value="uvicorn app.main:app",
+        )
+        res = self.verifier.verify(claim, str(tmp_path))
+        assert res.verdict == Verdict.DRIFTED
+        assert "not declared" in res.evidence
+        assert res.suggested_value == "uvicorn app.main:server"
+
+    def test_asgi_entrypoint_with_syntax_error_drifted(self, tmp_path: Path):
+        app_dir = tmp_path / "app"
+        app_dir.mkdir()
+        (app_dir / "main.py").write_text("def broken_func(\n    pass\n", encoding="utf-8")
+        claim = Claim(
+            doc_path="README.md",
+            line_number=1,
+            raw_line="uvicorn app.main:app",
+            claim_type=ClaimType.COMMAND_SCRIPT,
+            extracted_value="uvicorn app.main:app",
+        )
+        res = self.verifier.verify(claim, str(tmp_path))
+        assert res.verdict == Verdict.DRIFTED
+        assert "syntax error" in res.evidence.lower()
+
+    def test_python_script_syntax_error_drifted(self, tmp_path: Path):
+        script = tmp_path / "run.py"
+        script.write_text("def syntax_err(\n    return 42\n", encoding="utf-8")
+        claim = Claim(
+            doc_path="README.md",
+            line_number=1,
+            raw_line="python run.py",
+            claim_type=ClaimType.COMMAND_SCRIPT,
+            extracted_value="python run.py",
+        )
+        res = self.verifier.verify(claim, str(tmp_path))
+        assert res.verdict == Verdict.DRIFTED
+        assert "syntax error" in res.evidence.lower()
 
     # --- Docker Ecosystem ---
     def test_docker_compose_service_verified(self):
