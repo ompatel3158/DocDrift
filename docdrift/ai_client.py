@@ -79,12 +79,27 @@ def validate_gemma_model(model: str) -> None:
 
 
 def _strip_markdown_code_fence(text: str) -> str:
-    """Strip markdown code fence wrapper (```json ... ```) if present."""
+    """Extract valid JSON from LLM text output, stripping commentary and fences."""
     text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*\n?", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\n?```\s*$", "", text)
-    return text.strip()
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
+    if match:
+        candidate = match.group(1).strip()
+    else:
+        candidate = re.sub(r"^```(?:json)?\s*\n?", "", text, flags=re.IGNORECASE)
+        candidate = re.sub(r"\n?```\s*$", "", candidate).strip()
+
+    for start_char, end_char in [("{", "}"), ("[", "]")]:
+        first_idx = candidate.find(start_char)
+        last_idx = candidate.rfind(end_char)
+        if first_idx != -1 and last_idx != -1 and last_idx > first_idx:
+            sub = candidate[first_idx : last_idx + 1]
+            try:
+                import json
+                json.loads(sub)
+                return sub
+            except Exception:
+                pass
+    return candidate
 
 
 class GemmaClient:
