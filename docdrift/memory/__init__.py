@@ -38,14 +38,14 @@ def get_memory_backend(
     if prefer_ultsql:
         try:
             if UltSQLMemoryBackend.is_available():
-                logger.info("Connecting to UltSQL Converged Memory Backend...")
+                logger.debug("Connecting to UltSQL Converged Memory Backend...")
                 return UltSQLMemoryBackend(repo_path=repo_path, db_path=db_path)
             else:
-                logger.warning(
+                logger.debug(
                     "UltSQL is requested but not available. Falling back to LocalMemoryBackend."
                 )
         except Exception as e:
-            logger.warning(
+            logger.debug(
                 f"Failed to initialize UltSQL backend ({e}). Falling back to LocalMemoryBackend."
             )
 

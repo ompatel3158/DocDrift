@@ -202,7 +202,12 @@ class InteractiveChat:
             except Exception as e:
                 self.console.print(f"[bold red]Error executing command:[/bold red] {e}")
 
-        # Cleanup if remote temporary clone
+        # Cleanup memory backend and remote temporary clone
+        if hasattr(self, "memory") and self.memory:
+            try:
+                self.memory.close()
+            except Exception:
+                pass
         if self.is_temp_clone:
             with self.console.status("[bold cyan]Cleaning up temporary clone sandbox...[/bold cyan]", spinner="dots"):
                 GitHelper.cleanup_temp_repo(self.repo_path)

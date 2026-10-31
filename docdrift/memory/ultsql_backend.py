@@ -112,10 +112,10 @@ def cleanup_ultsql_lock(db_path: str) -> bool:
 
     try:
         os.remove(lock_path)
-        logger.info(f"Removed stale UltSQL lock file at {lock_path}")
+        logger.debug(f"Removed stale UltSQL lock file at {lock_path}")
         return True
     except (PermissionError, OSError) as e:
-        logger.warning(f"Could not remove {lock_path} directly ({e}). Attempting process termination...")
+        logger.debug(f"Could not remove {lock_path} directly ({e}). Attempting process termination...")
         if sys.platform == "win32":
             try:
                 subprocess.run(
@@ -130,10 +130,10 @@ def cleanup_ultsql_lock(db_path: str) -> bool:
             try:
                 if os.path.exists(lock_path):
                     os.remove(lock_path)
-                    logger.info(f"Removed stale UltSQL lock file after process termination at {lock_path}")
+                    logger.debug(f"Removed stale UltSQL lock file after process termination at {lock_path}")
                     return True
             except Exception as e2:
-                logger.error(f"Failed to remove UltSQL lock file {lock_path}: {e2}")
+                logger.debug(f"Failed to remove UltSQL lock file {lock_path}: {e2}")
     return False
 
 
@@ -435,7 +435,7 @@ class UltSQLMemoryBackend(BaseMemoryBackend):
                 or "winerror 32" in err_msg
             )
             if is_lock:
-                logger.warning(
+                logger.debug(
                     f"UltSQL lock contention encountered on '{tool_name}': {e}. "
                     "Cleaning stale lock and retrying once..."
                 )
@@ -447,9 +447,8 @@ class UltSQLMemoryBackend(BaseMemoryBackend):
     def is_available(cls) -> bool:
         """Class method to verify UltSQL runtime availability."""
         client = UltSQLMCPClient()
-        available = client.is_available()
-        client.close()
-        return available
+        cmd = client._find_command()
+        return cmd is not None
 
     def get_diagnostics(self) -> Dict[str, Any]:
         """Diagnostic metrics regarding UltSQL daemon and database paths."""

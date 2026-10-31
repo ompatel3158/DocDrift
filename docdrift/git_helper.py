@@ -63,10 +63,17 @@ class GitHelper:
         if not repo_path:
             return
         parent = os.path.dirname(repo_path)
-        if "docdrift_repo_" in os.path.basename(parent):
-            shutil.rmtree(parent, ignore_errors=True)
-        elif "docdrift_repo_" in os.path.basename(repo_path):
-            shutil.rmtree(repo_path, ignore_errors=True)
+        target = parent if "docdrift_repo_" in os.path.basename(parent) else repo_path
+        if not ("docdrift_repo_" in os.path.basename(target) or "docdrift_repo_" in os.path.basename(parent)):
+            return
+
+        for _ in range(3):
+            try:
+                shutil.rmtree(target, ignore_errors=False)
+                return
+            except Exception:
+                time.sleep(0.15)
+        shutil.rmtree(target, ignore_errors=True)
 
     @staticmethod
     def get_commit_hash(repo_path: str) -> str:

@@ -66,6 +66,7 @@ def run_pipeline(
         prefer_ultsql = os.environ.get("DOCDRIFT_USE_ULTSQL", "true").lower() in ("true", "1", "yes")
 
     commit_sha = GitHelper.get_commit_hash(repo_path)
+    memory = None
 
     try:
         # 2. Initialize Memory Backend & Discover documentation files
@@ -243,6 +244,11 @@ def run_pipeline(
         return report
 
     finally:
+        if memory is not None:
+            try:
+                memory.close()
+            except Exception:
+                pass
         if is_temp_clone and cleanup_temp:
             with console.status("[bold cyan]Cleaning up temporary clone sandbox...[/bold cyan]", spinner="dots"):
                 GitHelper.cleanup_temp_repo(repo_path)
@@ -363,20 +369,26 @@ def memory(
     repo_path = os.path.abspath(target)
     mem = get_memory_backend(repo_path)
 
-    if clear:
-        mem.clear()
-        console.print(f"[bold green]Cleared DocDrift memory cache for:[/bold green] {repo_path}")
-        return
+    try:
+        if clear:
+            mem.clear()
+            console.print(f"[bold green]Cleared DocDrift memory cache for:[/bold green] {repo_path}")
+            return
 
-    stats = mem.get_stats()
-    table = Table(title="DocDrift Memory Engine Stats", border_style="cyan")
-    table.add_column("Property", style="bold yellow")
-    table.add_column("Value", style="green")
+        stats = mem.get_stats()
+        table = Table(title="DocDrift Memory Engine Stats", border_style="cyan")
+        table.add_column("Property", style="bold yellow")
+        table.add_column("Value", style="green")
 
-    for k, v in stats.items():
-        table.add_row(str(k), str(v))
+        for k, v in stats.items():
+            table.add_row(str(k), str(v))
 
-    console.print(table)
+        console.print(table)
+    finally:
+        try:
+            mem.close()
+        except Exception:
+            pass
 
 
 def _display_health_report(report: Any, console: Console) -> None:
