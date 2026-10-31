@@ -7,6 +7,7 @@ from docdrift.verifiers.sandbox_prober import SandboxCommandProber, ProbeResult
 from docdrift.verifiers.env_verifier import EnvVerifier
 from docdrift.verifiers.code_analyzer import CodeAnalyzer
 from docdrift.verifiers.dependency_verifier import DependencyVerifier
+from docdrift.verifiers.code_runner import CodeHealthVerifier, CodeHealthReport
 
 __all__ = [
     "BaseVerifier",
@@ -17,4 +18,6 @@ __all__ = [
     "EnvVerifier",
     "CodeAnalyzer",
     "DependencyVerifier",
+    "CodeHealthVerifier",
+    "CodeHealthReport",
 ]

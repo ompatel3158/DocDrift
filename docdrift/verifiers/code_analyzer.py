@@ -386,10 +386,14 @@ class CodeAnalyzer:
     # --------------------------------------------------------------------------
 
     @classmethod
-    def extract_imports_from_file(cls, file_path: Union[str, Path]) -> Set[str]:
+    def extract_imports_from_file(
+        cls, file_path: Union[str, Path], include_try_except: bool = True
+    ) -> Set[str]:
         """Extracts third-party package imports used in a source file.
 
         Excludes standard library and built-in modules.
+        If include_try_except is False, imports wrapped inside try/except blocks
+        handling ImportError or Exception are excluded (treating them as optional fallbacks).
         """
         path = Path(file_path).resolve()
         if not path.is_file():
@@ -410,17 +414,46 @@ class CodeAnalyzer:
             except Exception:
                 return imports
 
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
-                        root_mod = alias.name.split(".")[0]
-                        if root_mod and root_mod not in STDLIB_MODULES:
-                            imports.add(root_mod)
-                elif isinstance(node, ast.ImportFrom):
-                    if node.level == 0 and node.module:
-                        root_mod = node.module.split(".")[0]
-                        if root_mod and root_mod not in STDLIB_MODULES:
-                            imports.add(root_mod)
+            if include_try_except:
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        for alias in node.names:
+                            root_mod = alias.name.split(".")[0]
+                            if root_mod and root_mod not in STDLIB_MODULES:
+                                imports.add(root_mod)
+                    elif isinstance(node, ast.ImportFrom):
+                        if node.level == 0 and node.module:
+                            root_mod = node.module.split(".")[0]
+                            if root_mod and root_mod not in STDLIB_MODULES:
+                                imports.add(root_mod)
+            else:
+                class _ImportVisitor(ast.NodeVisitor):
+                    def __init__(self):
+                        self.in_try = 0
+                        self.found = set()
+
+                    def visit_Try(self, n):
+                        self.in_try += 1
+                        self.generic_visit(n)
+                        self.in_try -= 1
+
+                    def visit_Import(self, n):
+                        if self.in_try == 0:
+                            for alias in n.names:
+                                root = alias.name.split(".")[0]
+                                if root and root not in STDLIB_MODULES:
+                                    self.found.add(root)
+
+                    def visit_ImportFrom(self, n):
+                        if self.in_try == 0:
+                            if n.level == 0 and n.module:
+                                root = n.module.split(".")[0]
+                                if root and root not in STDLIB_MODULES:
+                                    self.found.add(root)
+
+                visitor = _ImportVisitor()
+                visitor.visit(tree)
+                imports = visitor.found
 
         # 2. JS / TS imports
         elif suffix in (".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"):

@@ -9,7 +9,12 @@ from docdrift.memory.base import (
     cosine_similarity,
 )
 from docdrift.memory.local_backend import LocalMemoryBackend
-from docdrift.memory.ultsql_backend import UltSQLMCPClient, UltSQLMemoryBackend
+from docdrift.memory.ultsql_backend import (
+    DatabaseLockException,
+    UltSQLMCPClient,
+    UltSQLMemoryBackend,
+    cleanup_ultsql_lock,
+)
 
 logger = logging.getLogger("docdrift.memory")
 
@@ -52,6 +57,8 @@ __all__ = [
     "LocalMemoryBackend",
     "UltSQLMemoryBackend",
     "UltSQLMCPClient",
+    "DatabaseLockException",
+    "cleanup_ultsql_lock",
     "get_memory_backend",
     "compute_symbol_embedding",
     "cosine_similarity",

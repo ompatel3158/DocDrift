@@ -98,3 +98,45 @@ class GitHelper:
             return True
         except Exception:
             return False
+
+    @staticmethod
+    def find_repo_root(start_path: Optional[str] = None) -> str:
+        """Auto-detects the repository or project root by traversing upwards."""
+        from pathlib import Path
+        curr = Path(start_path or os.getcwd()).resolve()
+        for parent in [curr] + list(curr.parents):
+            if (parent / ".git").is_dir() or (parent / ".git").is_file():
+                return str(parent)
+            if any((parent / f).exists() for f in (
+                "pyproject.toml", "package.json", "Cargo.toml", "go.mod", "Makefile", "docker-compose.yml"
+            )):
+                return str(parent)
+            if any((parent / f).exists() for f in ("README.md", "README", "readme.md")):
+                return str(parent)
+        return str(curr)
+
+    @staticmethod
+    def detect_ecosystem(repo_path: str) -> Tuple[List[str], bool]:
+        """Detects languages, frameworks, and whether the repository is a monorepo."""
+        from pathlib import Path
+        repo = Path(repo_path)
+        ecosystems = []
+        is_monorepo = False
+
+        if any(repo.glob("*.py")) or any(repo.glob("*/*.py")) or (repo / "requirements.txt").exists() or (repo / "pyproject.toml").exists():
+            ecosystems.append("Python")
+        if (repo / "package.json").exists() or any(repo.glob("*/package.json")):
+            ecosystems.append("Node.js/TypeScript")
+        if (repo / "Cargo.toml").exists():
+            ecosystems.append("Rust")
+        if (repo / "go.mod").exists():
+            ecosystems.append("Go")
+        if (repo / "Dockerfile").exists() or (repo / "docker-compose.yml").exists():
+            ecosystems.append("Docker")
+
+        if (repo / "backend").is_dir() and (repo / "frontend").is_dir():
+            is_monorepo = True
+        elif any((repo / d).is_dir() for d in ("packages", "apps")):
+            is_monorepo = True
+
+        return ecosystems or ["General"], is_monorepo

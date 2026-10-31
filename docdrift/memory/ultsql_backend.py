@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -26,6 +27,129 @@ from docdrift.memory.base import (
 from docdrift.models import Claim, ClaimType, Verdict
 
 logger = logging.getLogger("docdrift.memory.ultsql")
+
+
+class DatabaseLockException(RuntimeError):
+    """Raised when an UltSQL database lock contention or stale lock occurs."""
+    pass
+
+
+def _assign_process_to_job_object(proc: subprocess.Popen) -> None:
+    """Ensure child process and all descendants are terminated when parent exits on Windows."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+        JobObjectExtendedLimitInformation = 9
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", wintypes.LARGE_INTEGER),
+                ("PerJobUserTimeLimit", wintypes.LARGE_INTEGER),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_uint64),
+                ("WriteOperationCount", ctypes.c_uint64),
+                ("OtherOperationCount", ctypes.c_uint64),
+                ("ReadTransferCount", ctypes.c_uint64),
+                ("WriteTransferCount", ctypes.c_uint64),
+                ("OtherTransferCount", ctypes.c_uint64),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryLimit", ctypes.c_size_t),
+                ("PeakJobMemoryLimit", ctypes.c_size_t),
+            ]
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if job:
+            info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            kernel32.SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            )
+            handle = int(proc._handle)
+            kernel32.AssignProcessToJobObject(job, handle)
+            proc._win_job_handle = job
+    except Exception as e:
+        logger.debug(f"Assigning process to Windows Job Object failed: {e}")
+
+
+def cleanup_ultsql_lock(db_path: str) -> bool:
+    """Removes stale or orphaned ultsql.lock in db_path.
+
+    If locked by a lingering ultsql.exe process on Windows (WinError 32),
+    terminates the lingering process and removes the lock file.
+    Returns True if a lock file was found and cleaned up.
+    """
+    if not db_path or db_path == ":memory:":
+        return False
+    lock_path = os.path.join(db_path, "ultsql.lock")
+    if not os.path.exists(lock_path):
+        return False
+
+    try:
+        os.remove(lock_path)
+        logger.info(f"Removed stale UltSQL lock file at {lock_path}")
+        return True
+    except (PermissionError, OSError) as e:
+        logger.warning(f"Could not remove {lock_path} directly ({e}). Attempting process termination...")
+        if sys.platform == "win32":
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", "ultsql.exe"],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+            except Exception:
+                pass
+            time.sleep(0.1)
+            try:
+                if os.path.exists(lock_path):
+                    os.remove(lock_path)
+                    logger.info(f"Removed stale UltSQL lock file after process termination at {lock_path}")
+                    return True
+            except Exception as e2:
+                logger.error(f"Failed to remove UltSQL lock file {lock_path}: {e2}")
+    return False
+
+
+def cleanup_known_orphan_locks() -> None:
+    """Cleans up known orphaned lock files across repository workspaces."""
+    cwd = os.getcwd()
+    candidates = [
+        os.path.join(cwd, ".docdrift", "ultsql_data"),
+        os.path.join(cwd, "tests", "fixtures", "sample_drifted_repo", ".docdrift", "ultsql_data"),
+    ]
+    for c in candidates:
+        cleanup_ultsql_lock(c)
+
+
+# Perform immediate cleanup of known orphaned locks
+cleanup_known_orphan_locks()
 
 
 class UltSQLMCPClient:
@@ -141,6 +265,9 @@ class UltSQLMCPClient:
             self._error_msg = str(e)
             raise RuntimeError(f"Failed to launch UltSQL MCP process ({cmd}): {e}") from e
 
+        if sys.platform == "win32":
+            _assign_process_to_job_object(self._proc)
+
         # Perform JSON-RPC initialization handshake
         init_req = {
             "jsonrpc": "2.0",
@@ -207,12 +334,18 @@ class UltSQLMCPClient:
             if "error" in res:
                 err = res["error"]
                 msg = err.get("message", "Unknown error")
+                err_lower = msg.lower()
+                if "lock" in err_lower or "databaselock" in err_lower or "winerror 32" in err_lower:
+                    raise DatabaseLockException(f"UltSQL MCP error calling '{tool_name}': {msg}")
                 raise RuntimeError(f"UltSQL MCP error calling '{tool_name}': {msg}")
 
             result_obj = res.get("result", {})
             if result_obj.get("isError"):
                 content = result_obj.get("content", [{}])
                 msg = content[0].get("text", "Unknown tool error") if content else "Error"
+                msg_lower = msg.lower()
+                if "lock" in msg_lower or "databaselock" in msg_lower or "winerror 32" in msg_lower:
+                    raise DatabaseLockException(f"UltSQL tool '{tool_name}' failed: {msg}")
                 raise RuntimeError(f"UltSQL tool '{tool_name}' failed: {msg}")
 
             content = result_obj.get("content", [])
@@ -228,6 +361,17 @@ class UltSQLMCPClient:
         """Terminate the UltSQL process and release pipes."""
         with self._lock:
             if self._proc:
+                pid = self._proc.pid
+                if sys.platform == "win32" and pid:
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(pid)],
+                            capture_output=True,
+                            timeout=2,
+                            check=False,
+                        )
+                    except Exception:
+                        pass
                 try:
                     self._proc.terminate()
                     self._proc.wait(timeout=2.0)
@@ -267,9 +411,37 @@ class UltSQLMemoryBackend(BaseMemoryBackend):
             self.db_path = os.path.join(docdrift_dir, "ultsql_data")
             os.makedirs(self.db_path, exist_ok=True)
 
+        # Automatic stale lock cleanup on initialization
+        self._cleanup_lock()
+
         self._client = client or UltSQLMCPClient()
         self._kv_keys: set[str] = set()
         self._init_schema()
+
+    def _cleanup_lock(self) -> bool:
+        """Removes stale or orphaned ultsql.lock in self.db_path."""
+        return cleanup_ultsql_lock(self.db_path)
+
+    def _call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
+        """Invoke an UltSQL tool with automatic stale lock recovery and retry."""
+        try:
+            return self._client.call_tool(tool_name, arguments)
+        except (DatabaseLockException, RuntimeError, OSError) as e:
+            err_msg = str(e).lower()
+            is_lock = (
+                isinstance(e, DatabaseLockException)
+                or "databaselock" in err_msg
+                or "lock" in err_msg
+                or "winerror 32" in err_msg
+            )
+            if is_lock:
+                logger.warning(
+                    f"UltSQL lock contention encountered on '{tool_name}': {e}. "
+                    "Cleaning stale lock and retrying once..."
+                )
+                self._cleanup_lock()
+                return self._client.call_tool(tool_name, arguments)
+            raise
 
     @classmethod
     def is_available(cls) -> bool:
@@ -300,7 +472,7 @@ class UltSQLMemoryBackend(BaseMemoryBackend):
             command_str TEXT
         );
         """
-        self._client.call_tool(
+        self._call_tool(
             "ultsql_query",
             {"database": self.db_path, "query": ddl_scripts},
         )
@@ -314,7 +486,7 @@ class UltSQLMemoryBackend(BaseMemoryBackend):
             embedding VECTOR
         );
         """
-        self._client.call_tool(
+        self._call_tool(
             "ultsql_query",
             {"database": self.db_path, "query": ddl_symbols},
         )
@@ -328,7 +500,7 @@ class UltSQLMemoryBackend(BaseMemoryBackend):
     def get_file_hash(self, path: str) -> Optional[str]:
         norm = self._norm_path(path)
         key = f"docdrift:hash:{norm}"
-        res = self._client.call_tool(
+        res = self._call_tool(
             "ultsql_kv_get",
             {"database": self.db_path, "key": key},
         )
@@ -339,7 +511,7 @@ class UltSQLMemoryBackend(BaseMemoryBackend):
     def set_file_hash(self, path: str, hash_val: str) -> None:
         norm = self._norm_path(path)
         key = f"docdrift:hash:{norm}"
-        self._client.call_tool(
+        self._call_tool(
             "ultsql_kv_set",
             {"database": self.db_path, "key": key, "value": hash_val},
         )
@@ -352,7 +524,7 @@ class UltSQLMemoryBackend(BaseMemoryBackend):
     def store_claim(self, claim: Claim) -> None:
         data = claim.model_dump(mode="json")
         data["doc_path"] = self._norm_path(data["doc_path"])
-        self._client.call_tool(
+        self._call_tool(
             "ultsql_doc_insert",
             {
                 "database": self.db_path,
@@ -370,7 +542,7 @@ class UltSQLMemoryBackend(BaseMemoryBackend):
                     val = self._norm_path(val)
                 doc_filter[k] = val
 
-        res = self._client.call_tool(
+        res = self._call_tool(
             "ultsql_doc_find",
             {
                 "database": self.db_path,
@@ -413,7 +585,7 @@ class UltSQLMemoryBackend(BaseMemoryBackend):
             DELETE FROM manifest_scripts WHERE id = '{s_id}';
             INSERT INTO manifest_scripts VALUES ('{s_id}', '{c_eco}', '{c_path}', '{c_name}', '{c_cmd}');
             """
-            self._client.call_tool(
+            self._call_tool(
                 "ultsql_query",
                 {"database": self.db_path, "query": sql},
             )
@@ -439,7 +611,7 @@ class UltSQLMemoryBackend(BaseMemoryBackend):
             sql = f"""
             INSERT INTO repo_symbols VALUES ('{sym_id}', '{c_path}', '{c_name}', '{c_type}', '{vec_str}');
             """
-            self._client.call_tool(
+            self._call_tool(
                 "ultsql_query",
                 {"database": self.db_path, "query": sql},
             )
@@ -454,7 +626,7 @@ class UltSQLMemoryBackend(BaseMemoryBackend):
         query_vec = compute_symbol_embedding(query)
         where_clause = f"symbol_type = '{symbol_type}'" if symbol_type else None
 
-        res = self._client.call_tool(
+        res = self._call_tool(
             "ultsql_vector_search",
             {
                 "database": self.db_path,
@@ -496,7 +668,7 @@ class UltSQLMemoryBackend(BaseMemoryBackend):
     def clear(self) -> None:
         """Purge data across relational tables, document collections, and KV store."""
         try:
-            self._client.call_tool(
+            self._call_tool(
                 "ultsql_query",
                 {
                     "database": self.db_path,
@@ -509,23 +681,23 @@ class UltSQLMemoryBackend(BaseMemoryBackend):
 
         for key in list(self._kv_keys):
             try:
-                self._client.call_tool(
+                self._call_tool(
                     "ultsql_kv_set",
                     {"database": self.db_path, "key": key, "value": None, "ttl_seconds": 1},
                 )
             except Exception:
                 pass
-        self._kv_keys.clear()
+            self._kv_keys.clear()
 
     def get_stats(self) -> Dict[str, Any]:
         """Aggregate stats across UltSQL converged engines."""
-        claims_res = self._client.call_tool(
+        claims_res = self._call_tool(
             "ultsql_doc_find",
             {"database": self.db_path, "collection": "claims_history"},
         )
         claims_count = claims_res.get("matchedCount", 0) if isinstance(claims_res, dict) else 0
 
-        scripts_res = self._client.call_tool(
+        scripts_res = self._call_tool(
             "ultsql_query",
             {"database": self.db_path, "query": "SELECT COUNT(*) as cnt FROM manifest_scripts;"},
         )
@@ -533,7 +705,7 @@ class UltSQLMemoryBackend(BaseMemoryBackend):
         if isinstance(scripts_res, dict) and scripts_res.get("rows"):
             scripts_count = scripts_res["rows"][0].get("cnt", 0)
 
-        symbols_res = self._client.call_tool(
+        symbols_res = self._call_tool(
             "ultsql_query",
             {"database": self.db_path, "query": "SELECT COUNT(*) as cnt FROM repo_symbols;"},
         )

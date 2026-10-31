@@ -512,10 +512,10 @@ class DependencyVerifier(BaseVerifier):
     # --------------------------------------------------------------------------
 
     def _get_missing_imports_for_file(
-        self, py_file: Path, declared_pkgs: Set[str], repo: Path
+        self, py_file: Path, declared_pkgs: Set[str], repo: Path, include_try_except: bool = True
     ) -> List[str]:
         """Identifies any third-party imports in py_file that are not declared."""
-        imports = CodeAnalyzer.extract_imports_from_file(py_file)
+        imports = CodeAnalyzer.extract_imports_from_file(py_file, include_try_except=include_try_except)
         missing: List[str] = []
 
         local_modules = self._get_local_python_modules(repo)

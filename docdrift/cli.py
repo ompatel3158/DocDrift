@@ -49,11 +49,11 @@ def run_pipeline(
             repo_path, is_temp_clone = GitHelper.clone_repo(clean_target)
         console.print(f"  [green]✔[/green] Cloned shallow repository into temporary sandbox")
     else:
-        repo_path = os.path.abspath(clean_target)
-
-    if not os.path.exists(repo_path):
-        console.print(f"[bold red]Error:[/bold red] Target path '{repo_path}' does not exist.")
-        raise typer.Exit(code=1)
+        raw_path = os.path.abspath(clean_target)
+        if not os.path.exists(raw_path):
+            console.print(f"[bold red]Error:[/bold red] Target path '{raw_path}' does not exist.")
+            raise typer.Exit(code=1)
+        repo_path = GitHelper.find_repo_root(raw_path if os.path.isdir(raw_path) else os.path.dirname(raw_path))
 
     from docdrift.ai_client import load_env_file
     load_env_file([
@@ -377,6 +377,114 @@ def memory(
         table.add_row(str(k), str(v))
 
     console.print(table)
+
+
+def _display_health_report(report: Any, console: Console) -> None:
+    """Renders a clean rich table summarizing code health verification."""
+    table = Table(
+        title=f"Codebase Health & Execution Integrity Report: {os.path.basename(report.repo_path)}",
+        border_style="cyan" if report.is_code_working else "red",
+        expand=True,
+    )
+    table.add_column("Category", style="bold yellow", width=24)
+    table.add_column("Status", width=18)
+    table.add_column("Details & Evidence", style="white")
+
+    # 1. Syntax & Compilation
+    if not report.syntax_errors:
+        syntax_status = "[bold green]✔ Passed[/bold green]"
+        syntax_details = f"All {report.syntax_valid_count}/{report.total_files_checked} source files valid (0 syntax errors)"
+    else:
+        syntax_status = f"[bold red]✘ {len(report.syntax_errors)} Error(s)[/bold red]"
+        err_snippets = [f"{e['file']}: {e['error']}" for e in report.syntax_errors[:5]]
+        syntax_details = "\n".join(err_snippets)
+    table.add_row("Syntax & Compilation", syntax_status, syntax_details)
+
+    # 2. Entrypoints & Exports
+    if report.entrypoints_checked:
+        ep_status = f"[bold green]✔ Validated ({len(report.entrypoints_checked)})[/bold green]"
+        ep_details = []
+        for ep in report.entrypoints_checked:
+            ep_name = ep.get("entrypoint", "")
+            app_syms = ep.get("app_symbols", [])
+            sym_str = f" [cyan]({', '.join(app_syms)})[/cyan]" if app_syms else ""
+            ep_details.append(f"• {ep_name}{sym_str}")
+        table.add_row("Entrypoints & Exports", ep_status, "\n".join(ep_details))
+    else:
+        table.add_row("Entrypoints & Exports", "[dim yellow]None detected[/dim yellow]", "No standard entrypoint files (main.py, server.js, app.py) found")
+
+    # 3. Dependencies
+    if not report.missing_dependencies:
+        dep_status = "[bold green]✔ Consistent[/bold green]"
+        dep_details = "All source imports match declared manifest dependencies"
+    else:
+        dep_status = f"[bold red]✘ Missing ({len(report.missing_dependencies)})[/bold red]"
+        dep_details = f"Imports not found in manifests: {', '.join(report.missing_dependencies)}"
+    table.add_row("Dependencies", dep_status, dep_details)
+
+    # 4. Test Suite Execution
+    if report.test_suite_detected:
+        if report.test_suite_passed:
+            test_status = "[bold green]✔ Passed[/bold green]"
+        elif report.test_suite_passed is False:
+            test_status = "[bold red]✘ Failed[/bold red]"
+        else:
+            test_status = "[yellow]Unknown[/yellow]"
+        test_details = f"Command: {report.test_suite_detected}\n{report.test_output_summary or ''}".strip()
+        table.add_row("Test Suite", test_status, test_details)
+    else:
+        table.add_row("Test Suite", "[dim]Not detected[/dim]", "No test suite (pytest, npm test, make test) configured")
+
+    console.print(table)
+
+    status_style = "bold green" if report.is_code_working else "bold red"
+    status_text = "HEALTHY & EXECUTABLE (All integrity checks passed)" if report.is_code_working else "ISSUES DETECTED (Codebase has compilation, dependency, or test errors)"
+    console.print(Panel(f"[{status_style}]{status_text}[/{status_style}]", border_style="green" if report.is_code_working else "red"))
+
+
+@app.command(name="test")
+def test_cmd(
+    target: str = typer.Argument(".", help="Path to local repository or remote GitHub URL"),
+    run_tests: bool = typer.Option(True, "--run-tests/--no-run-tests", help="Run detected test suite"),
+    timeout: float = typer.Option(15.0, "--timeout", "-t", help="Timeout in seconds for test suite execution"),
+):
+    """Verify codebase health: syntax integrity, entrypoints, dependencies, and test suite."""
+    from docdrift.verifiers.code_runner import CodeHealthVerifier
+
+    is_temp_clone = False
+    clean_target = target.strip()
+    if GitHelper.is_git_url(clean_target):
+        with console.status(f"[bold cyan]Cloning remote repository:[/bold cyan] {clean_target} ...", spinner="dots"):
+            repo_path, is_temp_clone = GitHelper.clone_repo(clean_target)
+        console.print(f"  [green]✔[/green] Cloned shallow repository into temporary sandbox")
+    else:
+        raw_path = os.path.abspath(clean_target)
+        if not os.path.exists(raw_path):
+            console.print(f"[bold red]Error:[/bold red] Target path '{raw_path}' does not exist.")
+            raise typer.Exit(code=1)
+        repo_path = GitHelper.find_repo_root(raw_path if os.path.isdir(raw_path) else os.path.dirname(raw_path))
+
+    try:
+        with console.status("[bold cyan]Analyzing codebase health and execution integrity...[/bold cyan]", spinner="dots"):
+            report = CodeHealthVerifier.check_codebase_health(repo_path, run_tests=run_tests, test_timeout_sec=timeout)
+
+        _display_health_report(report, console)
+
+        if not report.is_code_working:
+            raise typer.Exit(code=1)
+    finally:
+        if is_temp_clone:
+            GitHelper.cleanup_temp_repo(repo_path)
+
+
+@app.command(name="health")
+def health_cmd(
+    target: str = typer.Argument(".", help="Path to local repository or remote GitHub URL"),
+    run_tests: bool = typer.Option(True, "--run-tests/--no-run-tests", help="Run detected test suite"),
+    timeout: float = typer.Option(15.0, "--timeout", "-t", help="Timeout in seconds for test suite execution"),
+):
+    """Verify codebase health: syntax integrity, entrypoints, dependencies, and test suite."""
+    test_cmd(target=target, run_tests=run_tests, timeout=timeout)
 
 
 @app.command()
