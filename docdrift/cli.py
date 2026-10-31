@@ -39,13 +39,14 @@ def run_pipeline(
     probe_commands: bool = True,
     prefer_ultsql: bool = True,
 ) -> DriftReport:
-    """Core verification pipeline execution."""
+    """Core verification pipeline execution with live progress reporting."""
     # 1. Resolve repository path (handling remote Git URLs if provided)
     is_temp_clone = False
     clean_target = target.strip()
     if GitHelper.is_git_url(clean_target):
-        console.print(f"[cyan]Cloning remote repository:[/cyan] {clean_target}")
-        repo_path, is_temp_clone = GitHelper.clone_repo(clean_target)
+        with console.status(f"[bold cyan]Cloning remote repository:[/bold cyan] {clean_target} ...", spinner="dots"):
+            repo_path, is_temp_clone = GitHelper.clone_repo(clean_target)
+        console.print(f"  [green]✔[/green] Cloned shallow repository into temporary sandbox")
     else:
         repo_path = os.path.abspath(clean_target)
 
@@ -64,16 +65,17 @@ def run_pipeline(
         prefer_ultsql = os.environ.get("DOCDRIFT_USE_ULTSQL", "true").lower() in ("true", "1", "yes")
 
     try:
-        # 2. Initialize Memory Backend (UltSQL with local fallback)
-        from docdrift.memory import get_memory_backend
-        memory = get_memory_backend(repo_path, prefer_ultsql=prefer_ultsql)
+        # 2. Initialize Memory Backend & Discover documentation files
+        with console.status("[bold cyan]Discovering documentation files and memory cache...[/bold cyan]", spinner="dots") as status:
+            from docdrift.memory import get_memory_backend
+            memory = get_memory_backend(repo_path, prefer_ultsql=prefer_ultsql)
 
-        # 3. Discover documentation files
-        scanner = DocScanner(repo_path)
-        doc_files = scanner.find_doc_files()
+            status.update("[bold cyan]Scanning repository for README and docs/*.md...[/bold cyan]")
+            scanner = DocScanner(repo_path)
+            doc_files = scanner.find_doc_files()
 
         if not doc_files:
-            console.print("[yellow]No documentation files (README or docs/*.md) found.[/yellow]")
+            console.print("  [yellow]ℹ No documentation files (README or docs/*.md) found.[/yellow]")
             return DriftReport(
                 repo_path=repo_path,
                 files_scanned=[],
@@ -84,76 +86,89 @@ def run_pipeline(
                 claims=[]
             )
 
-        # 4. Initialize AI Client & Extractor
-        from docdrift.ai_client import GemmaAIClient
-        from docdrift.extractor import HybridExtractor
-        ai_client = GemmaAIClient(model=model, offline=offline)
-        extractor = HybridExtractor(ai_client=ai_client, memory=memory)
+        console.print(f"  [green]✔[/green] Discovered [bold]{len(doc_files)}[/bold] documentation file(s)")
 
-        # 5. Extract claims across documents and sections
-        all_claims: List[Claim] = []
-        for doc_file in doc_files:
-            sections = scanner.parse_sections(doc_file)
-            for section in sections:
-                # Check memory cache: if section hash is already cached and unchanged, reuse claims
-                claims = extractor.extract_claims(section)
-                all_claims.extend(claims)
+        # 3. Initialize AI Client & Extractor
+        engine_label = "offline heuristic rules" if offline else f"Gemma 4 ({model})"
+        with console.status(f"[bold cyan]Extracting factual claims with {engine_label}...[/bold cyan]", spinner="dots") as status:
+            from docdrift.ai_client import GemmaAIClient
+            from docdrift.extractor import HybridExtractor
+            ai_client = GemmaAIClient(model=model, offline=offline)
+            extractor = HybridExtractor(ai_client=ai_client, memory=memory)
 
-        # 6. Initialize Deterministic Verifiers
-        from docdrift.verifiers.file_verifier import FileVerifier
-        from docdrift.verifiers.command_verifier import MultiManifestVerifier
-        from docdrift.verifiers.env_verifier import EnvVerifier
-        from docdrift.verifiers.sandbox_prober import SandboxCommandProber
+            all_claims: List[Claim] = []
+            for doc_file in doc_files:
+                rel_name = os.path.relpath(doc_file, repo_path)
+                status.update(f"[bold cyan]Extracting claims from {rel_name}...[/bold cyan]")
+                sections = scanner.parse_sections(doc_file)
+                for section in sections:
+                    claims = extractor.extract_claims(section)
+                    all_claims.extend(claims)
 
-        file_verifier = FileVerifier()
-        cmd_verifier = MultiManifestVerifier()
-        env_verifier = EnvVerifier(memory=memory)
-        sandbox_prober = SandboxCommandProber() if probe_commands else None
+        console.print(f"  [green]✔[/green] Extracted [bold]{len(all_claims)}[/bold] checkable factual claim(s)")
 
-        verified_count = 0
-        drifted_count = 0
-        unknown_count = 0
+        # 4. Initialize Deterministic Verifiers & Run Ground-Truth Verification
+        with console.status("[bold cyan]Deterministically verifying claims against codebase manifests & AST...[/bold cyan]", spinner="dots") as status:
+            from docdrift.verifiers.file_verifier import FileVerifier
+            from docdrift.verifiers.command_verifier import MultiManifestVerifier
+            from docdrift.verifiers.env_verifier import EnvVerifier
+            from docdrift.verifiers.sandbox_prober import SandboxCommandProber
 
-        # 7. Deterministic Verification Loop (Pure Python Code - No AI Hallucination)
-        for claim in all_claims:
-            v_res = None
-            if file_verifier.can_verify(claim):
-                v_res = file_verifier.verify(claim, repo_path)
-            elif cmd_verifier.can_verify(claim):
-                v_res = cmd_verifier.verify(claim, repo_path)
-                # If command exists in manifest, run optional safe sandbox probe
-                if v_res.verdict == Verdict.VERIFIED and sandbox_prober:
-                    probe_res = sandbox_prober.probe_command(claim.extracted_value, repo_path)
-                    if probe_res.evidence:
-                        v_res.evidence += f" | {probe_res.evidence}"
-            elif env_verifier.can_verify(claim):
-                v_res = env_verifier.verify(claim, repo_path)
+            file_verifier = FileVerifier()
+            cmd_verifier = MultiManifestVerifier()
+            env_verifier = EnvVerifier(memory=memory)
+            sandbox_prober = SandboxCommandProber() if probe_commands else None
 
-            if v_res:
-                claim.verdict = v_res.verdict
-                claim.evidence = v_res.evidence
-                claim.suggested_replacement = v_res.suggested_value
-            else:
-                claim.verdict = Verdict.UNKNOWN
-                claim.evidence = "No specialized verifier matched this claim type."
+            verified_count = 0
+            drifted_count = 0
+            unknown_count = 0
 
-            # Update counters
-            if claim.verdict == Verdict.VERIFIED:
-                verified_count += 1
-            elif claim.verdict == Verdict.DRIFTED:
-                drifted_count += 1
-            else:
-                unknown_count += 1
+            for i, claim in enumerate(all_claims, 1):
+                val_snippet = claim.extracted_value[:30] + "..." if len(claim.extracted_value) > 30 else claim.extracted_value
+                status.update(f"[bold cyan]Verifying claim {i}/{len(all_claims)}: [{claim.claim_type.value}] {val_snippet}[/bold cyan]")
+                v_res = None
+                if file_verifier.can_verify(claim):
+                    v_res = file_verifier.verify(claim, repo_path)
+                elif cmd_verifier.can_verify(claim):
+                    v_res = cmd_verifier.verify(claim, repo_path)
+                    if v_res.verdict == Verdict.VERIFIED and sandbox_prober:
+                        probe_res = sandbox_prober.probe_command(claim.extracted_value, repo_path)
+                        if probe_res.evidence:
+                            v_res.evidence += f" | {probe_res.evidence}"
+                elif env_verifier.can_verify(claim):
+                    v_res = env_verifier.verify(claim, repo_path)
 
-            # Save claim to memory store
-            memory.store_claim(claim)
+                if v_res:
+                    claim.verdict = v_res.verdict
+                    claim.evidence = v_res.evidence
+                    claim.suggested_replacement = v_res.suggested_value
+                else:
+                    claim.verdict = Verdict.UNKNOWN
+                    claim.evidence = "No specialized verifier matched this claim type."
 
-        # 8. Fix Generation for Drifted Claims (Gemma 4 surgical rewrite)
-        from docdrift.fixer import GemmaFixer
-        fixer = GemmaFixer(ai_client=ai_client)
-        for claim in all_claims:
-            if claim.verdict == Verdict.DRIFTED:
-                claim.fixed_line = fixer.generate_fix(claim)
+                if claim.verdict == Verdict.VERIFIED:
+                    verified_count += 1
+                elif claim.verdict == Verdict.DRIFTED:
+                    drifted_count += 1
+                else:
+                    unknown_count += 1
+
+                memory.store_claim(claim)
+
+        console.print(f"  [green]✔[/green] Ground-truth verification complete: [bold green]{verified_count} verified[/bold green], [bold red]{drifted_count} drifted[/bold red]")
+
+        # 5. Fix Generation for Drifted Claims (Gemma 4 surgical rewrite)
+        if drifted_count > 0:
+            fixer_label = "deterministic rule fixer" if offline else f"Gemma 4 ({model})"
+            with console.status(f"[bold cyan]Synthesizing surgical line fixes with {fixer_label}...[/bold cyan]", spinner="dots") as status:
+                from docdrift.fixer import GemmaFixer
+                fixer = GemmaFixer(ai_client=ai_client)
+                drifted_items = [c for c in all_claims if c.verdict == Verdict.DRIFTED]
+                for j, claim in enumerate(drifted_items, 1):
+                    status.update(f"[bold cyan]Synthesizing surgical rewrite {j}/{drifted_count} (line {claim.line_number})...[/bold cyan]")
+                    claim.fixed_line = fixer.generate_fix(claim)
+
+            console.print(f"  [green]✔[/green] Synthesized surgical line fixes for [bold]{drifted_count}[/bold] drifted claim(s)")
 
         report = DriftReport(
             repo_path=repo_path,
@@ -169,7 +184,8 @@ def run_pipeline(
 
     finally:
         if is_temp_clone:
-            GitHelper.cleanup_temp_repo(repo_path)
+            with console.status("[bold cyan]Cleaning up temporary clone sandbox...[/bold cyan]", spinner="dots"):
+                GitHelper.cleanup_temp_repo(repo_path)
 
 
 @app.command()
