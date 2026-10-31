@@ -118,6 +118,31 @@ class TestFileVerifier:
         res = self.verifier.verify(claim, str(SAMPLE_REPO))
         assert res.verdict == Verdict.VERIFIED
 
+
+    def test_verify_external_markdown_link(self):
+        claim = Claim(
+            doc_path="README.md",
+            line_number=1,
+            raw_line="See [GOVERNANCE.md](https://github.com/expressjs/discussions/blob/HEAD/docs/GOVERNANCE.md) for details.",
+            claim_type=ClaimType.FILE_PATH,
+            extracted_value="GOVERNANCE.md",
+        )
+        res = self.verifier.verify(claim, str(SAMPLE_REPO))
+        assert res.verdict == Verdict.VERIFIED
+        assert "external" in res.evidence.lower()
+
+    def test_verify_file_found_in_subdirectory_search(self):
+        claim = Claim(
+            doc_path="README.md",
+            line_number=1,
+            raw_line="Check `index.ts`",
+            claim_type=ClaimType.FILE_PATH,
+            extracted_value="index.ts",
+        )
+        res = self.verifier.verify(claim, str(SAMPLE_REPO))
+        assert res.verdict == Verdict.VERIFIED
+        assert "found in repository" in res.evidence.lower()
+
     def test_verify_completely_nonexistent_path(self):
         claim = Claim(
             doc_path="README.md",

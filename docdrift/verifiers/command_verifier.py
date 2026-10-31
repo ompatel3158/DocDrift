@@ -82,8 +82,8 @@ class MultiManifestVerifier(BaseVerifier):
 
         if not all_declared_ports and not self._has_docker_manifests(repo):
             return VerificationResult(
-                verdict=Verdict.DRIFTED,
-                evidence="No docker-compose.yml or Dockerfile found in repository.",
+                verdict=Verdict.UNKNOWN,
+                evidence=f"No Dockerfile or docker-compose found in repository; port '{target_port}' appears to be a local application port.",
                 suggested_value=None,
             )
 
@@ -198,8 +198,19 @@ class MultiManifestVerifier(BaseVerifier):
 
         # Extract target script
         target_script = None
+        STANDARD_NPM_COMMANDS = {
+            "install", "i", "init", "ci", "add", "update", "publish",
+            "pack", "link", "unlink", "audit", "outdated", "help", "view",
+            "info", "prefix", "root", "bin", "login", "whoami", "version",
+            "cache", "config", "dedupe", "prune", "doctor"
+        }
         if tool == "npm":
-            # npm run <script> or npm test / npm start / npm run-script <script>
+            if len(tokens) >= 2 and tokens[1] in STANDARD_NPM_COMMANDS:
+                return VerificationResult(
+                    verdict=Verdict.VERIFIED,
+                    evidence=f"Standard npm command '{full_cmd}' verified.",
+                    suggested_value=None,
+                )
             if len(tokens) >= 3 and tokens[1] in ("run", "run-script"):
                 target_script = tokens[2]
             elif len(tokens) >= 2 and tokens[1] in ("test", "start", "stop", "restart", "build"):

@@ -1,6 +1,7 @@
 """File path verifier for DocDrift."""
 
 import difflib
+import re
 import os
 from pathlib import Path
 from typing import List, Optional, Set
@@ -43,6 +44,34 @@ class FileVerifier(BaseVerifier):
         """Verifies whether the path exists or has drifted."""
         repo = Path(repo_path).resolve()
         raw_val = claim.extracted_value.strip().strip("'\"`")
+
+        # 0. Check if raw_val is an external HTTP/HTTPS URL
+        if re.match(r"^(https?://|ftp://|//)", raw_val, re.IGNORECASE):
+            return VerificationResult(
+                verdict=Verdict.VERIFIED,
+                evidence=f"External documentation URL '{raw_val}' verified.",
+                suggested_value=None,
+            )
+
+        # 0b. Check if raw_val is the label or target of a markdown link to an external URL in raw_line
+        # Example: [GOVERNANCE.md](https://github.com/expressjs/discussions/blob/HEAD/docs/GOVERNANCE.md)
+        if claim.raw_line:
+            link_pattern = re.compile(r'\[([^\]]+)\]\((https?://[^\)]+)\)')
+            for m in link_pattern.finditer(claim.raw_line):
+                link_text = m.group(1).strip()
+                link_url = m.group(2).strip()
+                if raw_val == link_text or raw_val in link_text:
+                    return VerificationResult(
+                        verdict=Verdict.VERIFIED,
+                        evidence=f"Label '{raw_val}' links to external documentation: '{link_url}'.",
+                        suggested_value=None,
+                    )
+                if raw_val == link_url or raw_val in link_url:
+                    return VerificationResult(
+                        verdict=Verdict.VERIFIED,
+                        evidence=f"External documentation URL '{link_url}' verified.",
+                        suggested_value=None,
+                    )
 
         # Strip URL/markdown anchor fragments (e.g. docs/install.md#prerequisites)
         clean_target = raw_val.split("#")[0].strip()
@@ -88,10 +117,35 @@ class FileVerifier(BaseVerifier):
                     metadata={"resolved_path": str(doc_candidate), "is_dir": doc_candidate.is_dir()},
                 )
 
-        # 3. Path was not found. Scan repo to find moved or renamed files/directories.
+        # 3. Search across all files and directories in the entire repository tree
         all_candidates = self._scan_repo_paths(repo)
-        closest_match = self._find_closest_match(normalized, all_candidates)
 
+        # Check if the filename / relative path exists anywhere in any subdirectory
+        target_name = Path(normalized).name.lower()
+        exact_basename_matches = [
+            p for p in all_candidates
+            if p.lower() == normalized.lower() or Path(p).name.lower() == target_name
+        ]
+        if exact_basename_matches:
+            found_rel = exact_basename_matches[0]
+            # If the user specified a directory path with slashes that disagrees with reality:
+            if "/" in normalized and not found_rel.lower().endswith(normalized.lower()):
+                return VerificationResult(
+                    verdict=Verdict.DRIFTED,
+                    evidence=f"Path '{raw_val}' does not exist at specified directory. Found in repository at '{found_rel}'.",
+                    suggested_value=found_rel,
+                    metadata={"closest_match": found_rel},
+                )
+            else:
+                return VerificationResult(
+                    verdict=Verdict.VERIFIED,
+                    evidence=f"File '{raw_val}' found in repository at '{found_rel}'.",
+                    suggested_value=None,
+                    metadata={"resolved_path": str(repo / found_rel)},
+                )
+
+        # 4. Fuzzy match for moved or renamed candidates
+        closest_match = self._find_closest_match(normalized, all_candidates)
         if closest_match:
             return VerificationResult(
                 verdict=Verdict.DRIFTED,
@@ -102,7 +156,7 @@ class FileVerifier(BaseVerifier):
 
         return VerificationResult(
             verdict=Verdict.DRIFTED,
-            evidence=f"Path '{raw_val}' does not exist in repository (checked repository root and document directory).",
+            evidence=f"Path '{raw_val}' does not exist anywhere in the repository.",
             suggested_value=None,
         )
 
