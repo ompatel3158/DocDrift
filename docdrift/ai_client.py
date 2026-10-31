@@ -47,13 +47,20 @@ def load_env_file(search_paths: Optional[List[str]] = None) -> None:
 
 load_env_file()
 
-DEFAULT_MODEL: str = os.environ.get("DOCDRIFT_MODEL", "gemma-4-26b-it")
+DEFAULT_MODEL: str = os.environ.get("DOCDRIFT_MODEL", "gemma-4-31b-it")
 SUPPORTED_MODELS: Set[str] = {
-    "gemma-4-26b-it",
     "gemma-4-31b-it",
+    "gemma-4-26b-it",
+    "gemma-4-26b-a4b-it",
     "gemma-4-26b",
     "gemma-4-31b",
 }
+
+def resolve_model_name(model: str) -> str:
+    """Normalize model identifier for Gemini API."""
+    if model in ("gemma-4-26b-it", "gemma-4-26b"):
+        return "gemma-4-26b-a4b-it"
+    return model
 
 T = TypeVar("T")
 
@@ -101,7 +108,7 @@ class GemmaClient:
             retry_delay: Initial retry delay in seconds for exponential backoff.
         """
         validate_gemma_model(model)
-        self.model = model
+        self.model = resolve_model_name(model)
         load_env_file()
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
         self.offline = offline or not bool(self.api_key)
