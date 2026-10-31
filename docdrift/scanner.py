@@ -23,6 +23,16 @@ DEFAULT_IGNORE_DIRS: Set[str] = {
     ".docdrift",
 }
 
+# Non-actionable documentation files (changelogs, license)
+DEFAULT_IGNORE_FILES: Set[str] = {
+    "history.md",
+    "changelog.md",
+    "changes.md",
+    "release_notes.md",
+    "license.md",
+    "license",
+}
+
 
 class DocScanner:
     """Discovers documentation files (README, docs/*.md) and splits them into sections."""
@@ -67,6 +77,8 @@ class DocScanner:
             dirs[:] = [d for d in dirs if d not in DEFAULT_IGNORE_DIRS and not d.startswith(".")]
 
             for file in files:
+                if file.lower() in DEFAULT_IGNORE_FILES or file.lower().startswith(("history-", "changelog-")):
+                    continue
                 if file.lower().endswith((".md", ".markdown")):
                     full_path = os.path.join(root, file)
                     add_file(full_path)

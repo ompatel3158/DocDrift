@@ -109,7 +109,6 @@ class GemmaClient:
         """
         validate_gemma_model(model)
         self.model = resolve_model_name(model)
-        load_env_file()
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
         self.offline = offline or not bool(self.api_key)
         self.max_retries = max_retries

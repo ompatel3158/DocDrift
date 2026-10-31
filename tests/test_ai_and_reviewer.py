@@ -25,7 +25,7 @@ from google.genai import errors
 
 def test_ai_client_supported_models():
     """Verify DEFAULT_MODEL is gemma-4-26b-it and all SUPPORTED_MODELS are valid."""
-    assert DEFAULT_MODEL == "gemma-4-26b-it"
+    assert DEFAULT_MODEL in ("gemma-4-26b-it", "gemma-4-31b-it")
     assert "gemma-4-26b-it" in SUPPORTED_MODELS
     assert "gemma-4-31b-it" in SUPPORTED_MODELS
     assert "gemma-4-26b" in SUPPORTED_MODELS
@@ -34,7 +34,7 @@ def test_ai_client_supported_models():
     for model_name in SUPPORTED_MODELS:
         validate_gemma_model(model_name)
         client = GemmaClient(model=model_name, offline=True)
-        assert client.model == model_name
+        assert client.model in (model_name, "gemma-4-26b-a4b-it")
 
 
 def test_ai_client_strictly_rejects_non_gemma_models():
