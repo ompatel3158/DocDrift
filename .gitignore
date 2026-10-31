@@ -33,6 +33,7 @@ htmlcov/
 
 # DocDrift persistent data
 .docdrift/
+ultsql_data/
 
 # Environment Variables
 .env
