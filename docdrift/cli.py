@@ -38,6 +38,7 @@ def run_pipeline(
     offline: bool = False,
     probe_commands: bool = True,
     prefer_ultsql: bool = True,
+    cleanup_temp: bool = False,
 ) -> DriftReport:
     """Core verification pipeline execution with live progress reporting."""
     # 1. Resolve repository path (handling remote Git URLs if provided)
@@ -64,6 +65,8 @@ def run_pipeline(
     if "DOCDRIFT_USE_ULTSQL" in os.environ:
         prefer_ultsql = os.environ.get("DOCDRIFT_USE_ULTSQL", "true").lower() in ("true", "1", "yes")
 
+    commit_sha = GitHelper.get_commit_hash(repo_path)
+
     try:
         # 2. Initialize Memory Backend & Discover documentation files
         with console.status("[bold cyan]Discovering documentation files and memory cache...[/bold cyan]", spinner="dots") as status:
@@ -83,7 +86,9 @@ def run_pipeline(
                 verified_count=0,
                 drifted_count=0,
                 unknown_count=0,
-                claims=[]
+                claims=[],
+                commit_sha=commit_sha,
+                is_temp_clone=is_temp_clone,
             )
 
         console.print(f"  [green]✔[/green] Discovered [bold]{len(doc_files)}[/bold] documentation file(s)")
@@ -126,6 +131,28 @@ def run_pipeline(
             for i, claim in enumerate(all_claims, 1):
                 val_snippet = claim.extracted_value[:30] + "..." if len(claim.extracted_value) > 30 else claim.extracted_value
                 status.update(f"[bold cyan]Verifying claim {i}/{len(all_claims)}: [{claim.claim_type.value}] {val_snippet}[/bold cyan]")
+
+                # False positive safeguard: check execution context
+                runs_in = getattr(claim, "runs_in", "repo")
+                if runs_in == "generated_app":
+                    claim.verdict = Verdict.UNKNOWN
+                    claim.evidence = f"Skipped: Command/file runs inside a tutorial demo app or generated subfolder ('{runs_in}')."
+                    unknown_count += 1
+                    memory.store_claim(claim)
+                    continue
+                elif runs_in == "user_machine":
+                    claim.verdict = Verdict.UNKNOWN
+                    claim.evidence = f"Skipped: Command/path refers to the user machine environment or absolute path ('{runs_in}')."
+                    unknown_count += 1
+                    memory.store_claim(claim)
+                    continue
+                elif runs_in == "external":
+                    claim.verdict = Verdict.VERIFIED
+                    claim.evidence = f"External link or service reference ('{runs_in}')."
+                    verified_count += 1
+                    memory.store_claim(claim)
+                    continue
+
                 v_res = None
                 if file_verifier.can_verify(claim):
                     v_res = file_verifier.verify(claim, repo_path)
@@ -157,18 +184,25 @@ def run_pipeline(
 
         console.print(f"  [green]✔[/green] Ground-truth verification complete: [bold green]{verified_count} verified[/bold green], [bold red]{drifted_count} drifted[/bold red]")
 
-        # 5. Fix Generation for Drifted Claims (Gemma 4 surgical rewrite)
+        # 5. Fix Generation for Drifted Claims (Gemma 4 surgical rewrite with code constraints)
         if drifted_count > 0:
             fixer_label = "deterministic rule fixer" if offline else f"Gemma 4 ({model})"
             with console.status(f"[bold cyan]Synthesizing surgical line fixes with {fixer_label}...[/bold cyan]", spinner="dots") as status:
-                from docdrift.fixer import GemmaFixer
-                fixer = GemmaFixer(ai_client=ai_client)
                 drifted_items = [c for c in all_claims if c.verdict == Verdict.DRIFTED]
-                for j, claim in enumerate(drifted_items, 1):
-                    status.update(f"[bold cyan]Synthesizing surgical rewrite {j}/{drifted_count} (line {claim.line_number})...[/bold cyan]")
-                    claim.fixed_line = fixer.generate_fix(claim)
+                if offline:
+                    from docdrift.fixer import RuleBasedFixer
+                    fixer = RuleBasedFixer(repo_path=repo_path)
+                    for j, claim in enumerate(drifted_items, 1):
+                        status.update(f"[bold cyan]Synthesizing surgical rewrite {j}/{drifted_count} (line {claim.line_number})...[/bold cyan]")
+                        fixer.fix_claim(claim, repo_path=repo_path)
+                else:
+                    from docdrift.fixer import GemmaFixer
+                    fixer = GemmaFixer(ai_client=ai_client, repo_path=repo_path)
+                    for j, claim in enumerate(drifted_items, 1):
+                        status.update(f"[bold cyan]Synthesizing surgical rewrite {j}/{drifted_count} (line {claim.line_number})...[/bold cyan]")
+                        fixer.fix_claim(claim, repo_path=repo_path)
 
-            console.print(f"  [green]✔[/green] Synthesized surgical line fixes for [bold]{drifted_count}[/bold] drifted claim(s)")
+            console.print(f"  [green]✔[/green] Processed surgical line fixes for [bold]{drifted_count}[/bold] drifted claim(s)")
 
         report = DriftReport(
             repo_path=repo_path,
@@ -177,13 +211,15 @@ def run_pipeline(
             verified_count=verified_count,
             drifted_count=drifted_count,
             unknown_count=unknown_count,
-            claims=all_claims
+            claims=all_claims,
+            commit_sha=commit_sha,
+            is_temp_clone=is_temp_clone,
         )
 
         return report
 
     finally:
-        if is_temp_clone:
+        if is_temp_clone and cleanup_temp:
             with console.status("[bold cyan]Cleaning up temporary clone sandbox...[/bold cyan]", spinner="dots"):
                 GitHelper.cleanup_temp_repo(repo_path)
 
@@ -202,37 +238,47 @@ def check(
 ):
     """Scan and verify documentation claims against the repository codebase."""
     console.print(f"[bold cyan]DocDrift v0.1.0[/bold cyan] checking: [yellow]{target}[/yellow]")
-    report = run_pipeline(
-        target=target,
-        model=model,
-        offline=offline,
-        probe_commands=probe,
-        prefer_ultsql=ultsql
-    )
+    report = None
+    try:
+        report = run_pipeline(
+            target=target,
+            model=model,
+            offline=offline,
+            probe_commands=probe,
+            prefer_ultsql=ultsql,
+            cleanup_temp=False,
+        )
 
-    reporter = Reporter(console=console)
-    reporter.print_terminal_report(report)
+        reporter = Reporter(console=console)
+        reporter.print_terminal_report(report)
 
-    if diff or (fix and report.has_drift):
-        console.print("[bold cyan]Git Unified Diff:[/bold cyan]")
-        reporter.print_diff(report)
+        if diff or (fix and report.has_drift):
+            console.print("[bold cyan]Git Unified Diff:[/bold cyan]")
+            reporter.print_diff(report)
 
-    if fix and report.has_drift:
-        modified = reporter.apply_fixes(report)
-        console.print(f"[bold green]Successfully updated {len(modified)} file(s) in place.[/bold green]")
+        if fix and report.has_drift:
+            modified = reporter.apply_fixes(report)
+            console.print(f"[bold green]Successfully updated {len(modified)} file(s) in place.[/bold green]")
 
-    if pr and report.has_drift:
-        commit_sha = GitHelper.get_commit_hash(report.repo_path)
-        pr_desc = reporter.generate_pr_description(report, commit_sha=commit_sha)
-        console.print(Panel(pr_desc, title="[bold green]Ready-to-Use GitHub PR Description[/bold green]", border_style="green"))
+        if pr and report.has_drift:
+            commit_sha = report.commit_sha or GitHelper.get_commit_hash(report.repo_path)
+            if not commit_sha or commit_sha == "unknown":
+                commit_sha = "HEAD"
+            pr_desc = reporter.generate_pr_description(report, commit_sha=commit_sha)
+            console.print(Panel(pr_desc, title="[bold green]Ready-to-Use GitHub PR Description[/bold green]", border_style="green"))
 
-    if json_output:
-        with open(json_output, "w", encoding="utf-8") as f:
-            f.write(report.model_dump_json(indent=2))
-        console.print(f"[dim]Report saved to: {json_output}[/dim]")
+        if json_output:
+            with open(json_output, "w", encoding="utf-8") as f:
+                f.write(report.model_dump_json(indent=2))
+            console.print(f"[dim]Report saved to: {json_output}[/dim]")
 
-    if report.has_drift and not fix:
-        raise typer.Exit(code=1)
+        if report.has_drift and not fix:
+            raise typer.Exit(code=1)
+
+    finally:
+        if report and report.is_temp_clone:
+            with console.status("[bold cyan]Cleaning up temporary clone sandbox...[/bold cyan]", spinner="dots"):
+                GitHelper.cleanup_temp_repo(report.repo_path)
 
 
 @app.command()
@@ -244,13 +290,18 @@ def review(
     """Interactively review and accept/edit/skip drifted claims one by one."""
     from docdrift.reviewer import InteractiveReviewer
 
-    report = run_pipeline(target=target, model=model, offline=offline)
-    if not report.has_drift:
-        console.print("[bold green]✨ No documentation drift found to review![/bold green]")
-        return
+    report = None
+    try:
+        report = run_pipeline(target=target, model=model, offline=offline, cleanup_temp=False)
+        if not report.has_drift:
+            console.print("[bold green]✨ No documentation drift found to review![/bold green]")
+            return
 
-    reviewer = InteractiveReviewer(console=console)
-    reviewer.review_report(report)
+        reviewer = InteractiveReviewer(console=console)
+        reviewer.review_report(report)
+    finally:
+        if report and report.is_temp_clone:
+            GitHelper.cleanup_temp_repo(report.repo_path)
 
 
 @app.command()

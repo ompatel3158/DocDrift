@@ -26,10 +26,15 @@ class Claim(BaseModel):
     section_title: Optional[str] = None
     claim_type: ClaimType
     extracted_value: str
+    runs_in: str = Field(
+        default="repo",
+        description="Execution context: 'repo' (in repository), 'generated_app' (tutorial demo app), 'user_machine' (global tool, /tmp, OS level), or 'external' (remote URL)"
+    )
     verdict: Verdict = Verdict.UNKNOWN
     evidence: str = ""
     suggested_replacement: Optional[str] = None
     fixed_line: Optional[str] = None
+    needs_review: bool = False
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -60,7 +65,19 @@ class DriftReport(BaseModel):
     drifted_count: int
     unknown_count: int
     claims: List[Claim]
+    commit_sha: str = "HEAD"
+    is_temp_clone: bool = False
 
     @property
     def has_drift(self) -> bool:
         return self.drifted_count > 0
+
+    @property
+    def actionable_drifted_count(self) -> int:
+        """Count of drifted claims that have a safe, validated fix."""
+        return sum(1 for c in self.claims if c.verdict == Verdict.DRIFTED and not c.needs_review and (c.fixed_line or c.suggested_replacement))
+
+    @property
+    def needs_review_count(self) -> int:
+        """Count of claims requiring human review (no safe fix found or unverified)."""
+        return sum(1 for c in self.claims if c.needs_review or (c.verdict == Verdict.DRIFTED and not c.fixed_line and not c.suggested_replacement))

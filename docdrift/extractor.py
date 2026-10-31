@@ -4,9 +4,10 @@ Extracts checkable documentation claims (file paths, command scripts,
 environment variables, docker ports) from DocSection instances.
 
 Provides:
-- GemmaClaimExtractor: queries Gemma 4 with structured schema.
-- RuleBasedExtractor: deterministic regex-based extraction.
+- GemmaClaimExtractor: queries Gemma 4 with structured schema and execution context tagging (runs_in).
+- RuleBasedExtractor: deterministic regex-based extraction with context awareness.
 - HybridExtractor: seamlessly uses Gemma 4 when available, falls back to RuleBasedExtractor.
+- apply_runs_in_safety_net: enforces execution context boundaries (repo vs generated_app vs user_machine vs external).
 """
 
 from __future__ import annotations
@@ -32,6 +33,10 @@ class ExtractedClaimItem(BaseModel):
     )
     extracted_value: str = Field(
         description="The specific claim token (e.g. 'src/app.py', 'npm test', 'PORT', '8080:8080')"
+    )
+    runs_in: str = Field(
+        default="repo",
+        description="Execution context: 'repo' (in repository root/source), 'generated_app' (tutorial demo app, created via generator or cd), 'user_machine' (global tool, /tmp, ~, home dir, OS level), or 'external' (remote URL)"
     )
 
 
@@ -64,8 +69,56 @@ COMMAND_PREFIXES = (
 COMMON_ENV_VARS = {"PORT", "HOST", "DEBUG", "SECRET", "TOKEN", "SALT", "NODE_ENV"}
 
 
+def apply_runs_in_safety_net(claims: List[Claim]) -> List[Claim]:
+    """Safety net enforcing execution context boundaries on all claims.
+
+    Guarantees:
+    - Absolute OS paths (/tmp, /var, ~, Windows drive) -> 'user_machine'.
+    - Global package manager commands (-g, --global) -> 'user_machine'.
+    - Scaffolding commands (express <dir>, create-react-app, etc.) -> 'generated_app'.
+    - Subsequent commands within a code block following a cd into a generated/tmp directory -> 'generated_app'.
+    - External links/URLs -> 'external'.
+    """
+    for c in claims:
+        val = c.extracted_value.strip().strip("'\"`")
+        raw = c.raw_line or ""
+        raw_lower = raw.lower()
+
+        # 1. External URL check
+        if re.match(r"^(https?://|ftp://)", val, re.IGNORECASE) or re.search(r"\]\((https?://)", raw):
+            c.runs_in = "external"
+            continue
+
+        # 2. Absolute user-machine path check (/tmp, /var, /etc, ~, C:\, D:\)
+        if (
+            re.search(r"(?:^|[/\\])(tmp|var|etc|home)(?:[/\\]|$)", val, re.IGNORECASE)
+            or val.startswith(("/tmp", "\\tmp", "~"))
+            or re.match(r"^[A-Za-z]:[/\\]", val)
+            or re.search(r"\b(/tmp/|\\tmp\\|~/)", raw)
+        ):
+            c.runs_in = "user_machine"
+            continue
+
+        # 3. Global tool install commands
+        if any(g in raw_lower for g in ("-g ", "--global", "install -g", "pip install --user", "brew install", "apt-get")):
+            c.runs_in = "user_machine"
+            continue
+
+        # 4. Scaffolding / generator commands
+        if any(k in raw_lower for k in ("express /", "express .", "create-react-app", "npm create", "pnpm create", "yarn create", "cargo new", "go mod init", "flutter create", "django-admin")):
+            c.runs_in = "generated_app"
+            continue
+
+        # 5. Commands following cd into non-repo directory
+        if "cd " in raw_lower and any(p in raw_lower for p in ("/tmp", "~", "temp", "foo", "bar", "my-app", "myapp")):
+            c.runs_in = "generated_app"
+            continue
+
+    return claims
+
+
 class RuleBasedExtractor:
-    """Deterministic regex-based documentation claim extractor."""
+    """Deterministic regex-based documentation claim extractor with execution context awareness."""
 
     def extract(self, section: DocSection) -> List[Claim]:
         """Extract claims deterministically from a DocSection.
@@ -79,11 +132,33 @@ class RuleBasedExtractor:
         claims: List[Claim] = []
         seen: Set[Tuple[int, ClaimType, str]] = set()
 
+        in_code_block = False
+        in_generated_context = False
+
         for idx, line in enumerate(section.lines):
             line_no = section.start_line + idx
             line_str = line.strip()
-            if not line_str:
+
+            if line_str.startswith("```"):
+                if in_code_block:
+                    in_code_block = False
+                    in_generated_context = False
+                else:
+                    in_code_block = True
                 continue
+
+            if not line_str:
+                if not in_code_block:
+                    in_generated_context = False
+                continue
+
+            line_lower = line_str.lower()
+
+            # Check if this line introduces a generated app or cd to ephemeral dir
+            if any(k in line_lower for k in ("express /", "express .", "create-react-app", "npm create", "pnpm create", "yarn create", "cargo new", "go mod init", "flutter create", "django-admin")):
+                in_generated_context = True
+            elif "cd " in line_lower and any(p in line_lower for p in ("/tmp", "~", "temp", "foo", "bar", "my-app", "myapp")):
+                in_generated_context = True
 
             # 1. Backticked tokens extraction
             backticked = re.findall(r"`([^`]+)`", line)
@@ -92,11 +167,13 @@ class RuleBasedExtractor:
                 if not token_clean:
                     continue
 
+                runs_in = self._determine_runs_in(line, token_clean, None, in_generated_context)
+
                 # Check: Command Script
                 if self._is_command(token_clean):
                     self._add_claim(
                         claims, seen, section, line_no, line,
-                        ClaimType.COMMAND_SCRIPT, token_clean
+                        ClaimType.COMMAND_SCRIPT, token_clean, runs_in=runs_in
                     )
                     continue
 
@@ -104,7 +181,7 @@ class RuleBasedExtractor:
                 if self._is_file_path(token_clean):
                     self._add_claim(
                         claims, seen, section, line_no, line,
-                        ClaimType.FILE_PATH, token_clean
+                        ClaimType.FILE_PATH, token_clean, runs_in=runs_in
                     )
                     continue
 
@@ -113,7 +190,7 @@ class RuleBasedExtractor:
                 if port_match:
                     self._add_claim(
                         claims, seen, section, line_no, line,
-                        ClaimType.DOCKER_PORT, port_match.group(1)
+                        ClaimType.DOCKER_PORT, port_match.group(1), runs_in=runs_in
                     )
                     continue
 
@@ -121,44 +198,75 @@ class RuleBasedExtractor:
                 if self._is_env_var(token_clean):
                     self._add_claim(
                         claims, seen, section, line_no, line,
-                        ClaimType.ENV_VAR, token_clean
+                        ClaimType.ENV_VAR, token_clean, runs_in=runs_in
                     )
                     continue
 
             # 2. Line-level command extraction (e.g. $ npm test, or line starting with command)
-            self._extract_line_commands(claims, seen, section, line_no, line)
+            self._extract_line_commands(claims, seen, section, line_no, line, in_generated_context)
 
             # 3. Line-level Docker Port extraction (e.g. -p 8080:8080, EXPOSE 3000, localhost:5000)
-            self._extract_line_ports(claims, seen, section, line_no, line)
+            self._extract_line_ports(claims, seen, section, line_no, line, in_generated_context)
 
             # 4. Line-level Env Var extraction (e.g. export FOO=bar, DATABASE_URL=postgres://...)
-            self._extract_line_env_vars(claims, seen, section, line_no, line)
+            self._extract_line_env_vars(claims, seen, section, line_no, line, in_generated_context)
 
-        return claims
+        return apply_runs_in_safety_net(claims)
+
+    def _determine_runs_in(
+        self,
+        line: str,
+        token: str,
+        claim_type: Optional[ClaimType],
+        in_generated_context: bool,
+    ) -> str:
+        """Determines the execution context ('repo', 'generated_app', 'user_machine', 'external')."""
+        token_clean = token.strip().strip("'\"`")
+        line_lower = line.lower()
+
+        # External URLs
+        if re.match(r"^(https?://|ftp://)", token_clean, re.IGNORECASE) or re.search(r"\]\((https?://)", line):
+            return "external"
+
+        # User machine absolute paths
+        if (
+            re.search(r"(?:^|[/\\])(tmp|var|etc|home)(?:[/\\]|$)", token_clean, re.IGNORECASE)
+            or token_clean.startswith(("/tmp", "\\tmp", "~"))
+            or re.match(r"^[A-Za-z]:[/\\]", token_clean)
+        ):
+            return "user_machine"
+
+        # Global tools
+        if any(g in line_lower for g in ("-g ", "--global", "install -g", "pip install --user", "brew install", "apt-get")):
+            return "user_machine"
+
+        # Generator commands
+        if any(k in line_lower for k in ("express /", "express .", "create-react-app", "npm create", "pnpm create", "yarn create", "cargo new", "go mod init", "flutter create", "django-admin")):
+            return "generated_app"
+
+        # Already inside generated context
+        if in_generated_context:
+            return "generated_app"
+
+        return "repo"
 
     def _is_file_path(self, token: str) -> bool:
         """Check if token represents a file or directory path."""
-        # Exclude URLs and commands
         if re.match(r"^[a-zA-Z]+://", token) or " " in token:
             return False
-        # Exclude CLI options like --version, -rf
         if token.startswith("-"):
             return False
 
         lower = token.lower()
 
-        # Check special filenames
         base = lower.split("/")[-1]
         if base in SPECIAL_FILENAMES:
             return True
 
-        # Check path slashes
         if "/" in token or "\\" in token:
-            # Avoid mathematical or generic expressions
             if re.search(r"[a-zA-Z0-9_\-\.]+[/\\][a-zA-Z0-9_\-\.]+", token):
                 return True
 
-        # Check extension
         for ext in FILE_EXTENSIONS:
             if lower.endswith(ext) and len(lower) > len(ext):
                 return True
@@ -172,13 +280,14 @@ class RuleBasedExtractor:
                 return True
         if token.startswith("./") and (" " in token or token.endswith(".sh") or token.endswith(".py")):
             return True
+        if token.startswith("express ") or token.startswith("git "):
+            return True
         return False
 
     def _is_env_var(self, token: str) -> bool:
         """Check if token is an environment variable name."""
         if not re.match(r"^[A-Z][A-Z0-9_]{1,}$", token):
             return False
-        # Must have an underscore (e.g. DATABASE_URL) or be a recognized standard env var
         if "_" in token or token in COMMON_ENV_VARS:
             return True
         return False
@@ -190,15 +299,18 @@ class RuleBasedExtractor:
         section: DocSection,
         line_no: int,
         line: str,
+        in_generated_context: bool,
     ) -> None:
         stripped = line.strip()
-        # Prompt prefix removal: "$ npm test" -> "npm test"
         cmd_candidate = re.sub(r"^[$#>]\s*", "", stripped)
-        for prefix in COMMAND_PREFIXES:
+        runs_in = self._determine_runs_in(line, cmd_candidate, ClaimType.COMMAND_SCRIPT, in_generated_context)
+
+        all_prefixes = COMMAND_PREFIXES + ("express ", "git ")
+        for prefix in all_prefixes:
             if cmd_candidate.startswith(prefix):
                 self._add_claim(
                     claims, seen, section, line_no, line,
-                    ClaimType.COMMAND_SCRIPT, cmd_candidate
+                    ClaimType.COMMAND_SCRIPT, cmd_candidate, runs_in=runs_in
                 )
                 break
 
@@ -209,31 +321,30 @@ class RuleBasedExtractor:
         section: DocSection,
         line_no: int,
         line: str,
+        in_generated_context: bool,
     ) -> None:
-        # Match -p 8080:8080 or --publish 8080:8080
+        runs_in = self._determine_runs_in(line, "", ClaimType.DOCKER_PORT, in_generated_context)
         docker_port_match = re.search(r"(?:-p|--publish)\s+[\"']?(\d{2,5}:\d{2,5})[\"']?", line)
         if docker_port_match:
             self._add_claim(
                 claims, seen, section, line_no, line,
-                ClaimType.DOCKER_PORT, docker_port_match.group(1)
+                ClaimType.DOCKER_PORT, docker_port_match.group(1), runs_in=runs_in
             )
             return
 
-        # Match EXPOSE 8080
         expose_match = re.search(r"\bEXPOSE\s+(\d{2,5})\b", line, re.IGNORECASE)
         if expose_match:
             self._add_claim(
                 claims, seen, section, line_no, line,
-                ClaimType.DOCKER_PORT, expose_match.group(1)
+                ClaimType.DOCKER_PORT, expose_match.group(1), runs_in=runs_in
             )
             return
 
-        # Match localhost:3000 or 127.0.0.1:8000
         host_port = re.search(r"(?:localhost|127\.0\.0\.1):(\d{2,5})", line)
         if host_port:
             self._add_claim(
                 claims, seen, section, line_no, line,
-                ClaimType.DOCKER_PORT, host_port.group(1)
+                ClaimType.DOCKER_PORT, host_port.group(1), runs_in=runs_in
             )
 
     def _extract_line_env_vars(
@@ -243,22 +354,22 @@ class RuleBasedExtractor:
         section: DocSection,
         line_no: int,
         line: str,
+        in_generated_context: bool,
     ) -> None:
-        # Match export FOO_BAR=...
+        runs_in = self._determine_runs_in(line, "", ClaimType.ENV_VAR, in_generated_context)
         export_match = re.findall(r"\bexport\s+([A-Z][A-Z0-9_]{2,})=", line)
         for var in export_match:
             self._add_claim(
                 claims, seen, section, line_no, line,
-                ClaimType.ENV_VAR, var
+                ClaimType.ENV_VAR, var, runs_in=runs_in
             )
 
-        # Match inline VAR=val assignment if VAR is uppercase
         assign_matches = re.findall(r"\b([A-Z][A-Z0-9_]{2,})=(?!\s)", line)
         for var in assign_matches:
             if "_" in var or var in COMMON_ENV_VARS:
                 self._add_claim(
                     claims, seen, section, line_no, line,
-                    ClaimType.ENV_VAR, var
+                    ClaimType.ENV_VAR, var, runs_in=runs_in
                 )
 
     def _add_claim(
@@ -270,6 +381,7 @@ class RuleBasedExtractor:
         raw_line: str,
         claim_type: ClaimType,
         extracted_value: str,
+        runs_in: str = "repo",
     ) -> None:
         key = (line_no, claim_type, extracted_value)
         if key in seen:
@@ -283,12 +395,13 @@ class RuleBasedExtractor:
                 section_title=section.section_title,
                 claim_type=claim_type,
                 extracted_value=extracted_value,
+                runs_in=runs_in,
             )
         )
 
 
 class GemmaClaimExtractor:
-    """Uses Gemma 4 structured JSON generation to accurately extract claims."""
+    """Uses Gemma 4 structured JSON generation to accurately extract claims and execution contexts."""
 
     EXTRACTION_PROMPT_TEMPLATE = """You are an expert documentation code verifier.
 Analyze the following documentation section and extract all checkable technical claims.
@@ -305,11 +418,19 @@ Allowed Claim Types:
 - 'env_var': Environment variables and configuration keys (e.g., `DATABASE_URL`, `PORT`, `API_KEY`).
 - 'docker_port': Port numbers or docker port mappings (e.g., `8080:8080`, `localhost:3000`, `EXPOSE 5000`).
 
+CRITICAL: Execution Context Tagging (`runs_in`):
+For each claim, determine where it executes or belongs:
+- 'repo': Commands, scripts, or files that belong directly to THIS repository and should be verified against this repo's root code/manifests (e.g. `npm test`, `src/index.js`, `pytest`).
+- 'generated_app': Tutorial or Quick Start commands that run inside a generated app or subfolder created by the reader (e.g. `express /tmp/foo && cd /tmp/foo`, then `npm start` or `npm install`, `create-react-app myapp`). These MUST NOT be verified against the repo!
+- 'user_machine': Commands installing global CLI tools (`npm install -g express-generator`, `brew install`, `apt-get`), or paths in `/tmp`, `/var`, `~`, or user home directories.
+- 'external': External URLs, documentation links, or third-party web services.
+
 Extract each claim with:
 - line_number: The integer line number where the claim appears.
 - raw_line: The exact line text from the snippet.
 - claim_type: Must be one of 'file_path', 'command_script', 'env_var', 'docker_port'.
 - extracted_value: The specific token/value to verify against code.
+- runs_in: 'repo', 'generated_app', 'user_machine', or 'external'.
 """
 
     def __init__(self, client: GemmaClient) -> None:
@@ -364,15 +485,17 @@ Extract each claim with:
             try:
                 c_type = ClaimType(item.claim_type.lower())
             except ValueError:
-                # Skip invalid or unrecognized types
                 continue
 
-            # Verify and resolve line number
             target_line_no = item.line_number
             idx = target_line_no - section.start_line
             actual_line = item.raw_line
             if 0 <= idx < len(section.lines):
                 actual_line = section.lines[idx]
+
+            runs_in_val = getattr(item, "runs_in", "repo") or "repo"
+            if runs_in_val.lower() not in ("repo", "generated_app", "user_machine", "external"):
+                runs_in_val = "repo"
 
             claims.append(
                 Claim(
@@ -382,10 +505,11 @@ Extract each claim with:
                     section_title=section.section_title,
                     claim_type=c_type,
                     extracted_value=item.extracted_value,
+                    runs_in=runs_in_val.lower(),
                 )
             )
 
-        return claims
+        return apply_runs_in_safety_net(claims)
 
 
 class HybridExtractor:
@@ -418,22 +542,19 @@ class HybridExtractor:
         Returns:
             List of Claim instances.
         """
-        # If client is configured and online, attempt Gemma 4 extraction
         if self.client and not self.client.is_offline and self.gemma_extractor:
             try:
                 gemma_claims = self.gemma_extractor.extract(section)
                 if gemma_claims:
-                    return gemma_claims
+                    return apply_runs_in_safety_net(gemma_claims)
                 logger.debug("Gemma 4 returned no claims; falling back to rule-based extractor.")
             except Exception as e:
                 logger.warning(
                     f"Gemma 4 claim extraction encountered error ({e}); falling back to rule-based extractor."
                 )
 
-        # Seamless fallback
-        return self.rule_extractor.extract(section)
+        return apply_runs_in_safety_net(self.rule_extractor.extract(section))
 
     def extract_claims(self, section: DocSection) -> List[Claim]:
         """Alias for extract()."""
         return self.extract(section)
-

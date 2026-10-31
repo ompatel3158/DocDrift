@@ -73,6 +73,19 @@ class FileVerifier(BaseVerifier):
                         suggested_value=None,
                     )
 
+        # 0c. Check if path is absolute OS path or outside repo execution context
+        is_abs = (
+            raw_val.startswith(("/tmp", "\tmp", "/var", "/etc", "~"))
+            or (len(raw_val) >= 2 and raw_val[1] == ":" and raw_val[0].isalpha())
+            or getattr(claim, "runs_in", "repo") in ("user_machine", "generated_app")
+        )
+        if is_abs:
+            return VerificationResult(
+                verdict=Verdict.UNKNOWN,
+                evidence=f"Path '{raw_val}' is an absolute or user machine environment path, not a repository file.",
+                suggested_value=None,
+            )
+
         # Strip URL/markdown anchor fragments (e.g. docs/install.md#prerequisites)
         clean_target = raw_val.split("#")[0].strip()
         if not clean_target:

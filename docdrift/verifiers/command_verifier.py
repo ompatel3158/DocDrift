@@ -24,6 +24,13 @@ except ImportError:
 from docdrift.models import Claim, ClaimType, Verdict, VerificationResult
 from docdrift.verifiers.base import BaseVerifier
 
+SEMANTIC_SCRIPT_GROUPS: Dict[str, Set[str]] = {
+    "start": {"start", "dev", "serve", "server", "watch", "run", "start:dev", "start:prod", "up"},
+    "test": {"test", "spec", "check", "test-tap", "jest", "mocha", "pytest", "test:unit", "test:e2e"},
+    "build": {"build", "compile", "bundle", "dist", "transpile"},
+    "lint": {"lint", "format", "check-format", "style", "audit", "prettier", "eslint"},
+}
+
 
 class MultiManifestVerifier(BaseVerifier):
     """Verifies commands, scripts, targets, and docker ports across multiple ecosystems.
@@ -250,11 +257,17 @@ class MultiManifestVerifier(BaseVerifier):
                 metadata={"script": target_script, "command": scripts[target_script]},
             )
 
-        # Missing script - find closest match
-        closest = self._find_closest_string(target_script, available)
+        # Missing script - find closest match respecting semantic category
+        closest = self._find_closest_script(target_script, available)
         suggested = None
         if closest:
-            suggested = full_cmd.replace(target_script, closest)
+            if tool == "npm":
+                if closest in ("test", "start", "stop", "restart") and "run" not in tokens:
+                    suggested = f"npm {closest}"
+                else:
+                    suggested = f"npm run {closest}"
+            else:
+                suggested = full_cmd.replace(target_script, closest)
 
         evidence = (
             f"Script '{target_script}' is not defined in package.json. "
@@ -978,12 +991,37 @@ class MultiManifestVerifier(BaseVerifier):
         return re.findall(r"\b\d{2,5}\b", port_str)
 
     @classmethod
-    def _find_closest_string(cls, target: str, choices: List[str]) -> Optional[str]:
-        """Finds closest matching string using difflib."""
+    def _find_closest_script(cls, target: str, choices: List[str]) -> Optional[str]:
+        """Finds closest matching script respecting semantic intent (e.g. start vs test)."""
         if not choices or not target:
             return None
-        matches = difflib.get_close_matches(target, choices, n=1, cutoff=0.3)
-        if matches:
-            return matches[0]
-        fallback = difflib.get_close_matches(target, choices, n=1, cutoff=0.0)
-        return fallback[0] if fallback else choices[0]
+
+        target_lower = target.lower()
+        target_cat = None
+        for cat, members in SEMANTIC_SCRIPT_GROUPS.items():
+            if target_lower in members:
+                target_cat = cat
+                break
+
+        if target_cat:
+            cat_choices = [c for c in choices if c.lower() in SEMANTIC_SCRIPT_GROUPS[target_cat]]
+            if cat_choices:
+                if target_lower in ("dev", "serve", "run") and "start" in cat_choices:
+                    return "start"
+                matches = difflib.get_close_matches(target, cat_choices, n=1, cutoff=0.2)
+                if matches:
+                    return matches[0]
+                return cat_choices[0]
+            # Prevent cross-category hallucinated suggestions
+            return None
+
+        matches = difflib.get_close_matches(target, choices, n=1, cutoff=0.4)
+        return matches[0] if matches else None
+
+    @classmethod
+    def _find_closest_string(cls, target: str, choices: List[str]) -> Optional[str]:
+        """Finds closest matching string using difflib with safe cutoff."""
+        if not choices or not target:
+            return None
+        matches = difflib.get_close_matches(target, choices, n=1, cutoff=0.35)
+        return matches[0] if matches else None
