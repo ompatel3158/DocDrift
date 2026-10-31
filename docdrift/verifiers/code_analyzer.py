@@ -424,11 +424,11 @@ class CodeAnalyzer:
 
         # 2. JS / TS imports
         elif suffix in (".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"):
-            # import ... from 'pkg' or require('pkg')
             patterns = [
-                re.compile(r"""(?:import|from)\s+['"]([^'"]+)['"]"""),
-                re.compile(r"""require\s*\(\s*['"]([^'"]+)['"]\s*\)"""),
-                re.compile(r"""import\s*\(\s*['"]([^'"]+)['"]\s*\)"""),
+                re.compile(r"(?:^|\n|\;)\s*(?:import|export)\s+(?:.*?from\s+)?['\"]([^'\"]+)['\"]"),
+                re.compile(r"(?:^|\n|\;)\s*from\s+['\"]([^'\"]+)['\"]"),
+                re.compile(r"require\s*\(\s*['\"]([^'\"]+)['\"]\s*\)"),
+                re.compile(r"import\s*\(\s*['\"]([^'\"]+)['\"]\s*\)"),
             ]
             for pat in patterns:
                 for match in pat.finditer(content):
@@ -445,7 +445,13 @@ class CodeAnalyzer:
                     else:
                         pkg = parts[0]
 
-                    if pkg and pkg not in NODE_STDLIB_MODULES:
+                    # Validate strict npm package identifier format (letters, digits, @, -, _, .)
+                    if not re.match(r"^(@[a-zA-Z0-9_\-\.]+\/)?[a-zA-Z0-9_\-\.]+$", pkg):
+                        continue
+                    if any(c in pkg for c in ("+", " ", "\\", "*", ":", "'", '"', "=", "(", ")")):
+                        continue
+
+                    if pkg and pkg.lower() not in NODE_STDLIB_MODULES:
                         imports.add(pkg)
 
         return imports

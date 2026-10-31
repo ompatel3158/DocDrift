@@ -338,7 +338,8 @@ class DependencyVerifier(BaseVerifier):
         missing_by_file: Dict[str, List[str]] = {}
 
         for code_file in repo.glob("**/*.[jt]s*"):
-            if any(d in code_file.parts for d in (".git", "node_modules", ".next", ".nuxt", "dist", "build")):
+            # Exclude build, cache, test, and fixture directories for general package install checks
+            if any(d in code_file.parts for d in (".git", "node_modules", ".next", ".nuxt", "dist", "build", "test", "tests", "__tests__", "fixtures", "benchmarks", "examples")):
                 continue
             imports = CodeAnalyzer.extract_imports_from_file(code_file)
             missing = [
@@ -359,7 +360,7 @@ class DependencyVerifier(BaseVerifier):
                     f"Package manifest '{rel_pkg}' is missing dependencies imported in source code: "
                     f"{', '.join(missing_list)} (used in '{sample_file}')."
                 ),
-                suggested_value=f"npm install {' '.join(missing_list)}",
+                suggested_value=None,  # Do not propose raw string substitution into doc commands
                 metadata={"missing_dependencies": missing_list},
             )
 
