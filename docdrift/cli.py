@@ -379,6 +379,28 @@ def memory(
     console.print(table)
 
 
+@app.command()
+def chat(
+    target: str = typer.Argument(".", help="Path to local repository or remote GitHub URL"),
+    model: str = typer.Option("gemma-4-26b-it", "--model", "-m", help="Gemma 4 model: gemma-4-26b-it or gemma-4-31b-it"),
+    offline: bool = typer.Option(False, "--offline", help="Run offline without API key"),
+    probe: bool = typer.Option(True, "--probe/--no-probe", help="Safely probe command execution on PATH"),
+    ultsql: bool = typer.Option(True, "--ultsql/--no-ultsql", help="Use UltSQL converged memory engine"),
+):
+    """Start an interactive conversational chat session with DocDrift and Gemma 4."""
+    from docdrift.chat import InteractiveChat
+
+    session = InteractiveChat(
+        repo_path=target,
+        model=model,
+        offline=offline,
+        probe_commands=probe,
+        prefer_ultsql=ultsql,
+        console=console,
+    )
+    session.start()
+
+
 def main():
     app()
 

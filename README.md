@@ -2,7 +2,7 @@
 
 > **An AI + deterministic code verifier that catches outdated README and documentation claims and fixes them.**
 
-[![Tests](https://img.shields.io/badge/Tests-185%20passing-brightgreen.svg)](#)
+[![Tests](https://img.shields.io/badge/Tests-199%20passing-brightgreen.svg)](#)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](#)
 [![AI Engine](https://img.shields.io/badge/AI-Gemma%204%20(26B%20%2F%2031B)-orange.svg)](#)
 [![Memory Engine](https://img.shields.io/badge/Memory-UltSQL%20Multimodal%20Converged-purple.svg)](#)
@@ -214,7 +214,7 @@ docdrift memory . --clear
 DocDrift includes a test suite with 100% pass rate:
 
 ```bash
-# Run all 185 tests
+# Run all 199 tests
 uv run pytest -v
 
 # Run verifier tests
