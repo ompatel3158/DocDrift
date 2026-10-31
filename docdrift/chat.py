@@ -52,12 +52,16 @@ class InteractiveChat:
 
         # 1. Resolve repository path
         clean_target = repo_path.strip()
+        self.target = clean_target
         if GitHelper.is_git_url(clean_target):
             with self.console.status(f"[bold cyan]Cloning remote repository:[/bold cyan] {clean_target} ...", spinner="dots"):
                 self.repo_path, self.is_temp_clone = GitHelper.clone_repo(clean_target)
             self.console.print(f"  [green]✔[/green] Cloned shallow repository into temporary sandbox")
+            url_repo = clean_target.rstrip("/").split("/")[-1].replace(".git", "")
+            self.repo_name = url_repo if url_repo else os.path.basename(self.repo_path)
         else:
             self.repo_path = os.path.abspath(clean_target)
+            self.repo_name = os.path.basename(self.repo_path)
 
         if not os.path.exists(self.repo_path):
             raise FileNotFoundError(f"Target repository path '{self.repo_path}' does not exist.")
@@ -112,7 +116,7 @@ class InteractiveChat:
 
     def _render_welcome_banner(self) -> None:
         """Renders rich greeting panel with repo status and shortcuts."""
-        repo_name = os.path.basename(self.repo_path)
+        repo_name = getattr(self, "repo_name", os.path.basename(self.repo_path))
         doc_count = len(self.doc_files)
         model_label = f"Offline Mode" if self.offline else f"Gemma 4 ({self.model})"
         engine_label = "UltSQL Converged" if self.prefer_ultsql else "Local SQLite"
@@ -122,7 +126,8 @@ class InteractiveChat:
             f"[bold cyan]Documentation Files:[/bold cyan] {doc_count} detected | [bold cyan]AI Engine:[/bold cyan] {model_label}\n"
             f"[bold cyan]Memory Engine:[/bold cyan] {engine_label} | [bold cyan]Code Verification:[/bold cyan] [green]Active[/green]\n\n"
             f"[dim]Ask questions in plain English or use slash commands:[/dim]\n"
-            f"  [bold green]/check[/bold green]      Run full verification scan on repository\n"
+            f"  [bold green]/check[/bold green]      Run full verification scan on repository documentation\n"
+            f"  [bold green]/test[/bold green]       Verify code health, syntax, entrypoints & dependencies\n"
             f"  [bold green]/drift[/bold green]      Show current drifted claims and proof\n"
             f"  [bold green]/fix[/bold green]        Apply safe code-constrained fixes in-place\n"
             f"  [bold green]/diff[/bold green]       View unified git diff of proposed fixes\n"
@@ -142,8 +147,21 @@ class InteractiveChat:
 
     def _build_system_instruction(self) -> str:
         """Generates system instruction giving Gemma 4 codebase ground truth."""
-        repo_name = os.path.basename(self.repo_path)
+        repo_name = getattr(self, "repo_name", os.path.basename(self.repo_path))
         doc_names = [os.path.relpath(p, self.repo_path) for p in self.doc_files]
+
+        # Read the primary README excerpt (first 100 lines / ~3KB) if available
+        readme_summary = ""
+        for doc in self.doc_files:
+            if os.path.basename(doc).lower() in ("readme.md", "readme"):
+                try:
+                    with open(doc, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = [f.readline() for _ in range(100)]
+                        readme_summary = "".join(lines).strip()
+                        if readme_summary:
+                            break
+                except Exception:
+                    pass
 
         # Collect manifest scripts and targets
         scripts_info = []
@@ -157,17 +175,21 @@ class InteractiveChat:
         if make_targets:
             scripts_info.append(f"Makefile targets: {list(make_targets.keys())}")
 
+        readme_block = f"\n\nPrimary README Overview:\n\"\"\"\n{readme_summary}\n\"\"\"\n" if readme_summary else ""
+
         return (
             f"You are DocDrift, an intelligent documentation synchronization and codebase verifier assistant. "
             f"You are assisting a developer in repository '{repo_name}' (commit {self.commit_sha}).\n"
             f"Repository documentation files: {', '.join(doc_names) if doc_names else 'None'}.\n"
-            f"Manifest information: {'; '.join(scripts_info) if scripts_info else 'None'}.\n\n"
+            f"Manifest information: {'; '.join(scripts_info) if scripts_info else 'None'}."
+            f"{readme_block}\n"
             f"Guidelines:\n"
-            f"1. Be concise, direct, and technically accurate.\n"
+            f"1. Be concise, direct, helpful, and technically accurate.\n"
             f"2. Every claim in docs must align with code manifests and actual source code.\n"
-            f"3. When answering about drift or outdated instructions, cite the exact file and line number.\n"
-            f"4. You can instruct the user to run slash commands such as /check, /fix, /diff, or /pr to take action.\n"
-            f"5. Do not hallucinate files or scripts that do not exist in the repository."
+            f"3. When answering about what the project is about, summarize the purpose, key features, architecture, and tech stack using the README and codebase ground truth.\n"
+            f"4. When answering about drift or outdated instructions, cite the exact file and line number.\n"
+            f"5. You can instruct the user to run slash commands such as /check, /test, /fix, /diff, or /pr to take action.\n"
+            f"6. Do not hallucinate files or scripts that do not exist in the repository."
         )
 
     # --------------------------------------------------------------------------
@@ -226,6 +248,8 @@ class InteractiveChat:
             self._cmd_help()
         elif cmd in ("/check", "/scan"):
             self._cmd_check(arg)
+        elif cmd in ("/test", "/health"):
+            self._cmd_test(arg)
         elif cmd in ("/drift", "/status"):
             self._cmd_drift()
         elif cmd == "/fix":
@@ -255,6 +279,7 @@ class InteractiveChat:
         table.add_column("Example", style="dim cyan")
 
         table.add_row("/check [file]", "Run verification scan across repository or single file", "/check backend/README.md")
+        table.add_row("/test", "Verify codebase health: syntax, entrypoints, dependencies & tests", "/test")
         table.add_row("/drift", "Display currently detected documentation drift and proofs", "/drift")
         table.add_row("/fix", "Apply validated code-constrained fixes in-place", "/fix")
         table.add_row("/diff", "Show unified git diff of proposed line replacements", "/diff")
@@ -266,7 +291,7 @@ class InteractiveChat:
         table.add_row("/exit", "Exit the interactive chat session", "/exit")
 
         self.console.print(table)
-        self.console.print("\n[dim]Tip: You can also ask plain English questions like 'Why did npm start fail?' or 'What env vars are needed?'[/dim]")
+        self.console.print("\n[dim]Tip: You can also ask plain English questions like 'What is this project about?' or 'Why did npm start fail?'[/dim]")
 
     def _cmd_check(self, target_file: Optional[str] = None) -> None:
         """Runs DocDrift verification pipeline."""
@@ -291,6 +316,16 @@ class InteractiveChat:
                 f"\n[bold yellow]Found {self.current_report.drifted_count} drifted claim(s).[/bold yellow] "
                 f"Type [bold green]/diff[/bold green] to review changes, [bold green]/fix[/bold green] to apply in-place, or [bold green]/pr[/bold green] for PR description."
             )
+
+    def _cmd_test(self, arg: str = "") -> None:
+        """Runs codebase health & execution verification."""
+        from docdrift.verifiers.code_runner import CodeHealthVerifier
+        from docdrift.cli import _display_health_report
+
+        with self.console.status("[bold cyan]Verifying codebase syntax, entrypoints, dependencies & tests...[/bold cyan]", spinner="dots"):
+            health_report = CodeHealthVerifier.check_codebase_health(self.repo_path, run_tests=True, test_timeout_sec=15.0)
+
+        _display_health_report(health_report, self.console)
 
     def _cmd_drift(self) -> None:
         """Shows summary table of drifted claims."""
@@ -483,6 +518,9 @@ class InteractiveChat:
         if any(w in q_lower for w in ("run check", "verify repo", "scan doc", "check repo", "check documentation")):
             self._cmd_check()
             return
+        if any(w in q_lower for w in ("run test", "check health", "is code working", "test code", "code health")):
+            self._cmd_test()
+            return
         if any(w in q_lower for w in ("show diff", "what is the diff", "view diff", "git diff")):
             self._cmd_diff()
             return
@@ -504,14 +542,34 @@ class InteractiveChat:
         # 1. Native GenAI multi-turn chat if online and active
         if self._genai_chat is not None:
             try:
-                # Augment message with latest drift context if available
-                augmented_prompt = query
+                # Augment message with latest context if available
+                context_parts = []
                 if self.current_report and self.current_report.drifted_count > 0:
                     drift_summary = "; ".join(
                         f"{c.doc_path}:{c.line_number} '{c.extracted_value}' -> {c.evidence}"
                         for c in self.current_report.claims if c.verdict == Verdict.DRIFTED
                     )
-                    augmented_prompt = f"[Current Drift Context: {drift_summary}]\n\n{query}"
+                    context_parts.append(f"Current Drift Context: {drift_summary}")
+                elif self.current_report and self.current_report.verified_count > 0:
+                    context_parts.append(f"Current Scan Context: {self.current_report.verified_count} verified claims matching codebase.")
+
+                # If asking what the project is about or general summary, attach primary README excerpt
+                q_lower = query.lower()
+                if any(w in q_lower for w in ("what is", "about", "overview", "purpose", "explain", "how does it work", "architecture")):
+                    for doc in self.doc_files:
+                        if os.path.basename(doc).lower() in ("readme.md", "readme"):
+                            try:
+                                with open(doc, "r", encoding="utf-8", errors="ignore") as f:
+                                    snippet = f.read(3000).strip()
+                                    if snippet:
+                                        context_parts.append(f"Primary README excerpt:\n{snippet}")
+                                        break
+                            except Exception:
+                                pass
+
+                augmented_prompt = query
+                if context_parts:
+                    augmented_prompt = f"[{' | '.join(context_parts)}]\n\nUser Question: {query}"
 
                 resp = self._genai_chat.send_message(augmented_prompt)
                 if resp and resp.text:
@@ -532,8 +590,22 @@ class InteractiveChat:
                         if c.verdict == Verdict.DRIFTED:
                             context_notes.append(f"Drift at {c.doc_path}:{c.line_number}: {c.extracted_value} ({c.evidence})")
 
+                # Attach README excerpt for project overview questions
+                q_lower = query.lower()
+                if any(w in q_lower for w in ("what is", "about", "overview", "purpose", "explain", "how does it work", "architecture")):
+                    for doc in self.doc_files:
+                        if os.path.basename(doc).lower() in ("readme.md", "readme"):
+                            try:
+                                with open(doc, "r", encoding="utf-8", errors="ignore") as f:
+                                    snippet = f.read(3000).strip()
+                                    if snippet:
+                                        context_notes.append(f"Primary README excerpt:\n{snippet}")
+                                        break
+                            except Exception:
+                                pass
+
                 prompt = (
-                    f"Repository Context: {os.path.basename(self.repo_path)}\n"
+                    f"Repository Context: {self.repo_name}\n"
                     f"Status: {'; '.join(context_notes)}\n\n"
                     f"User Question: {query}\n\n"
                     f"Answer accurately based on the codebase facts and recommend /commands when helpful."
@@ -551,6 +623,24 @@ class InteractiveChat:
         """Grounded offline response generation using repository AST and manifests."""
         q = query.lower()
         repo = Path(self.repo_path)
+
+        # Questions about project purpose / what the project is about
+        if any(w in q for w in ("what is", "about", "overview", "purpose", "describe", "explain")):
+            for doc in self.doc_files:
+                if os.path.basename(doc).lower() in ("readme.md", "readme"):
+                    try:
+                        with open(doc, "r", encoding="utf-8", errors="ignore") as f:
+                            lines = []
+                            for line in f:
+                                s = line.strip()
+                                if s and not s.startswith("#") and not s.startswith("[!") and not s.startswith("!"):
+                                    lines.append(s)
+                                    if len(lines) >= 6:
+                                        break
+                            if lines:
+                                return f"**Project Overview ({self.repo_name}):**\n\n" + "\n\n".join(lines) + f"\n\nType `/check` to verify documentation claims or `/files` to view scanned docs."
+                    except Exception:
+                        pass
 
         # Questions about scripts or commands
         if any(w in q for w in ("script", "command", "npm", "poetry", "make", "start", "test", "dev")):

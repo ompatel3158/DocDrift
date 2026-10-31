@@ -161,6 +161,23 @@ def test_natural_language_queries(sample_repo, mock_console):
     ans3 = chat._offline_answer("What readme files exist?")
     assert "README.md" in ans3
 
+    # Question about project overview
+    ans4 = chat._offline_answer("What is this project about?")
+    assert "Project Overview" in ans4 or "Sample App" in ans4
+
+
+def test_chat_slash_test_command(sample_repo, mock_console):
+    chat = InteractiveChat(repo_path=str(sample_repo), offline=True, console=mock_console)
+    chat._handle_slash_command("/test")
+    output = mock_console.file.getvalue()
+    assert "Codebase Health & Execution Integrity" in output or "Integrity" in output
+
+
+def test_chat_repo_name_from_git_url(mock_console):
+    with patch("docdrift.git_helper.GitHelper.clone_repo", return_value=(os.getcwd(), True)):
+        chat = InteractiveChat(repo_path="https://github.com/anmolchaudhary617-ux/CivicPulse", offline=True, console=mock_console)
+        assert chat.repo_name == "CivicPulse"
+
 
 def test_chat_loop_exit_command(sample_repo, mock_console):
     chat = InteractiveChat(repo_path=str(sample_repo), offline=True, console=mock_console)
